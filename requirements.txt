@@ -1,0 +1,36 @@
+# SOMA pipeline — Python dependencies (pip-installable).
+#
+# NOTE: versions are intentionally unpinned. The code was developed against a
+# specific CUDA/PyTorch stack on a SLURM cluster (conda env "musk"); pin these
+# to your environment as needed. See README.md for the Blender-API note.
+
+# --- Core numerics / IO ---
+numpy
+scipy
+pandas
+
+# --- Computer vision / geometry ---
+opencv-python          # cv2
+trimesh
+transforms3d
+pyzbar                 # QR/marker decoding (needs system libzbar)
+av                     # PyAV, video IO
+
+# --- Deep learning ---
+torch                  # install the build matching your CUDA toolkit
+
+# --- Motion / data ---
+pymotion
+
+# --- Visualization / reporting ---
+matplotlib
+viser
+reportlab              # PDF generation (suit manufacturing sheets)
+
+# --- Utilities ---
+loguru
+tqdm
+
+# --- Blender Python API (bpy, mathutils, bmesh, gpu, gpu_extras) is NOT a pip
+#     dependency: those modules are provided by the Blender runtime. Scripts
+#     under 04-Blender/scripts/ are meant to be run inside Blender. ---

@@ -1,0 +1,81 @@
+# =============================================================
+#  SOMA pipeline — repository contains SOURCE CODE only.
+#  Bulk data, model checkpoints, Blender scenes, generated
+#  meshes/figures, and third-party cloned repos are excluded.
+# =============================================================
+
+# ---- Third-party cloned repos (not part of this project) ----
+00-Cloned/
+
+# ---- Excluded stages / scratch ----
+07-Rebuttal/
+README_example.md
+
+# ---- Bulk generated data dirs ----
+02-Canonical-Model/S1/
+02-Canonical-Model/S2/
+02-Canonical-Model/S3/
+02-Canonical-Model/S4/
+02-Canonical-Model/S5/
+04-Blender/data/
+05-Training/checkpoints/
+
+# ---- Archived code / logs / caches ----
+**/99-Archived/
+**/__pycache__/
+*.pyc
+*.pyo
+slurm_*.out
+*.out
+
+# ---- Model weights ----
+*.pth
+*.ckpt
+*.pt
+*.npz
+*.npy
+*.pkl
+
+# ---- 3D assets / Blender / meshes ----
+*.blend
+*.blend1
+*.ply
+*.obj
+*.stl
+*.fbx
+*.gltf
+*.glb
+*.bvh
+
+# ---- Images / documents / spreadsheets / archives ----
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.tif
+*.tiff
+*.pdf
+*.mp4
+*.mov
+*.xls
+*.xlsx
+*.gz
+*.zip
+*.tar
+
+# ---- Specific large data JSON (per-subject coverage dumps) ----
+07-Rebuttal/marker_coverage/coverage_*.json
+
+# ---- Project-page assets (committed intentionally) ----
+!docs/
+!docs/**
+docs/index.html
+
+# ---- Internal / not for publication ----
+CLAUDE.md
+
+# ---- OS / editor noise ----
+.DS_Store
+.idea/
+.vscode/
+*.swp

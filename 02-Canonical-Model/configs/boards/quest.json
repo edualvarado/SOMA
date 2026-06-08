@@ -1,0 +1,7 @@
+{
+  "board_type": "quest",
+  "marker_size": 90,
+  "front_size": [106, 212],
+  "side_size": [106, 106],
+  "top_size": [106, 212]
+}

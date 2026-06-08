@@ -1,0 +1,1 @@
+from .questboard import QuestBoard
