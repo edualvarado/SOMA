@@ -8,7 +8,7 @@
 <sup>1</sup> [Max Planck Institute for Informatics, Saarland Informatics Campus](https://www.mpi-inf.mpg.de/departments/visual-computing-and-artificial-intelligence) &nbsp;&nbsp; <sup>2</sup> [TU Dortmund University](https://www.tu-dortmund.de/en/)
 
 <!-- TODO: replace "(to be uploaded)" with real links when available -->
-**Project page** *(to be uploaded)* | **Paper** *(to be uploaded)* | **Video** *(to be uploaded)* | **Data** *(to be uploaded)*
+[**Project page**](https://vcai.mpi-inf.mpg.de/projects/SOMA/) | [**Paper**](https://arxiv.org/abs/2606.09246) | **Video** *(to be uploaded)* | **Data** *(to be uploaded)*
 
 <img src="docs/1.gif" alt="SOMA teaser" style="max-width: 100%;"/>
 
