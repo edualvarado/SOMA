@@ -231,5 +231,4 @@ If you use this project in your research, please cite:
 
 ## License
 
-<!-- TODO: choose a license and add a LICENSE file (e.g. MIT) -->
-TODO.
+Released under the [MIT License](LICENSE).
