@@ -968,9 +968,15 @@ LAMBDAS = LAMBDAS_PRESETS[ACTIVE_PRESET]
 # Adjust this base path to match new directory structure
 BASE_DIR = rf"/CT/SOMA/{CONFIG['base_path_suffix']}/{CONFIG['subject']}"
 
+# The packed training frames live in the self-contained SKIM dataset under static00; the raw/layers/
+# canonical inputs still read from BASE_DIR. Built by 05-Training/{preprocess_from_skim,pack_preprocessed}.py
+# from the pure-Python SKIM residual dataset (/CT/SOMA/static00/SKIM_dataset/<S>/shot_*.npz). The loader
+# (ProcessedMotionDataset) auto-detects the packed <shot>.npz layout.
+PROCESSED_ROOT = rf"/CT/SOMA/static00/SKIM_dataset/{CONFIG['subject']}/preprocessed_vFinal_clean"
+
 PATHS = {
     "raw": os.path.join(BASE_DIR, "raw"),
-    "processed": os.path.join(BASE_DIR, "preprocessed_vFinal_clean"),
+    "processed": PROCESSED_ROOT,
     "layers_tpose": os.path.join(BASE_DIR, "layers", "tpose"),
     "layers_apose": os.path.join(BASE_DIR, "layers", "apose"),
     "canonical": os.path.join(BASE_DIR, "canonical_model"),
@@ -980,11 +986,40 @@ PATHS = {
 
 # --- DATASET CLASS ---
 class ProcessedMotionDataset(Dataset):
+    """Loads the preprocessed training frames. Auto-detects two on-disk layouts:
+      * PACKED (default, light to distribute): one .npz per shot at the top of processed_dir
+        with arrays pose (F,J*6) / residuals (F,M,3) / masks (F,M). Loaded fully into RAM.
+      * LEGACY per-frame: pose_rotations/ residuals/ masks/ canonical_lbs/ dirs of *.npy.
+    Both yield the same 4-tuple (pose, residuals, masks, canonical_lbs); canonical_lbs is a zero
+    placeholder in packed mode (it is unused by the loss). `pose_rot_files` is a per-frame id list
+    used by the reproducible train/val split."""
+
     def __init__(self, processed_dir, preload=True):
         self.processed_dir = processed_dir
         self.preload = preload
-        
-        # 1. Find all files
+        self.packed = (not os.path.isdir(os.path.join(processed_dir, 'pose_rotations'))
+                       and len(glob.glob(os.path.join(processed_dir, '*.npz'))) > 0)
+
+        if self.packed:
+            files = sorted(glob.glob(os.path.join(processed_dir, '*.npz')))
+            poses, res, masks, ids = [], [], [], []
+            logger.info(f"[DATA] Loading {len(files)} packed shot .npz into RAM...")
+            for p in tqdm(files, desc="Loading Data"):
+                shot = os.path.basename(p)[:-4]
+                d = np.load(p)
+                poses.append(d["pose"].astype(np.float32))
+                res.append(d["residuals"].astype(np.float32))
+                masks.append(d["masks"].astype(np.float32))
+                ids += [f"{shot}_frame_{i:04d}" for i in range(d["pose"].shape[0])]
+            self._pose = np.concatenate(poses, 0)
+            self._res = np.concatenate(res, 0)
+            self._mask = np.concatenate(masks, 0)
+            self.pose_rot_files = ids
+            self._zero_lbs = torch.zeros(self._res.shape[1], 3, dtype=torch.float32)
+            logger.success(f"[DATA] Loaded {len(ids)} frames from packed shots.")
+            return
+
+        # ---- legacy per-frame layout ----
         self.pose_rot_files = sorted(glob.glob(os.path.join(processed_dir, 'pose_rotations', '*.npy')))
         self.residuals_dir = os.path.join(processed_dir, 'residuals')
         self.masks_dir = os.path.join(processed_dir, 'masks')
@@ -1009,7 +1044,7 @@ class ProcessedMotionDataset(Dataset):
         res_path = os.path.join(self.residuals_dir, base_filename)
         mask_path = os.path.join(self.masks_dir, base_filename)
         lbs_path = os.path.join(self.canonical_lbs_dir, base_filename)
-        
+
         return (
             torch.from_numpy(np.load(rot_path)).float(),
             torch.from_numpy(np.load(res_path)).float(),
@@ -1021,6 +1056,11 @@ class ProcessedMotionDataset(Dataset):
         return len(self.pose_rot_files)
 
     def __getitem__(self, idx):
+        if self.packed:
+            return (torch.from_numpy(self._pose[idx]).float(),
+                    torch.from_numpy(self._res[idx]).float(),
+                    torch.from_numpy(self._mask[idx]).float(),
+                    self._zero_lbs)
         if self.preload:
             return self.cache[idx]
         else:

@@ -73,6 +73,10 @@ docs/index.html
 
 # ---- Internal / not for publication ----
 CLAUDE.md
+08-Residuals-Python/RESUME.md
+08-Residuals-Python/FINDINGS.md
+*.bak
+*.preSKIM_bak
 
 # ---- OS / editor noise ----
 .DS_Store

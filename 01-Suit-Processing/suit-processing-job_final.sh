@@ -23,15 +23,15 @@
 
 # sbatch suit-processing-job_final.sh --folder /CT/SOMA/static00/data/Timothee-17-12-25/ --board /CT/SOMA/work/01-Suit-Processing/configs/suits/charuco-suit.json
 
-# tail slurm-48096400.out
-# squeue -j 48096400
+# tail slurm-.out
+# squeue -j 
 
 #-- MONA
 
 # sbatch suit-processing-job_final.sh --folder /CT/SOMA/static00/data/Mona-22-12-25/ --board /CT/SOMA/work/01-Suit-Processing/configs/suits/charuco-suit.json
 
-# tail slurm-48096403.out
-# squeue -j 48096403
+# tail slurm-48720473.out
+# squeue -j 48720473
 
 #-- SARAH (ALL DONE)
 
@@ -79,9 +79,9 @@ echo "=================================================="
 
 SHOTS_VALENTIN=()
 
-SHOTS_TIMO=("002" "003" "004" "005" "006" "007" "008" "009" "010" "011" "012" "013")
+SHOTS_TIMO=("009" "010" "011" "012")
 
-SHOTS_MONA=("005" "006" "007" "008" "009" "010" "011" "012" "013" "014")
+SHOTS_MONA=("003" "004" "005" "006" "007" "008" "009" "010" "011" "012" "013" "014") 
 
 SHOTS_SARAH=()
 

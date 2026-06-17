@@ -9,8 +9,8 @@ for both the muscle and skin layers.
 ## Pipeline Overview
 
 ```
-[04-Blender outputs, copied to static00/{S}/]
-  preprocessed_vFinal_clean/   ← 00_preprocess_data.py converts raw JSON → .npy
+[SKIM dataset, downloaded to static00/{S}/]
+  preprocessed_vFinal_clean/   ← packed per-shot .npz (training-ready; no preprocessing needed)
         |
         ↓
   01_end_to_end_training.py    ← train the model (interactive or SLURM)
@@ -32,41 +32,36 @@ for both the muscle and skin layers.
 
 ## Step-by-Step Instructions
 
-### Step 0 — Pre-process raw data (`00_preprocess_data.py`)
+### Step 0 — Get the data (no preprocessing needed)
 
-Converts raw per-shot JSON files (BVH, residuals, masks, LBS markers) from
-`static00/{S}/raw/` into per-frame `.npy` arrays ready for the DataLoader.
+The released SKIM dataset is already **training-ready**: each subject ships packed per-shot frames
+under `<S>/preprocessed_vFinal_clean/<shot>.npz` with arrays `pose` `(F, J*6)`,
+`residuals` `(F, M, 3)`, and `masks` `(F, M)`. Download the dataset and point `PROCESSED_ROOT` in
+`01_end_to_end_training.py` at it — the DataLoader (`ProcessedMotionDataset`) auto-detects the
+packed layout, so there is nothing to run in this step.
+
+```
+<S>/preprocessed_vFinal_clean/
+  shot_{N}.npz    # pose (F, J*6) float32 | residuals (F, M, 3) float16 | masks (F, M) uint8
+```
+
+<details>
+<summary>Rebuilding the training tensors from raw captures (reproducibility only)</summary>
+
+The packed frames were derived from the SKIM residual `.npz` (`<S>/shot_XXX.npz`):
+`preprocess_from_skim.py` reconstructs the BVH pose in the training 6D convention and pairs it with
+the scaled residuals + masks, then `pack_preprocessed.py` bundles each shot into one `.npz`. The
+original Blender-JSON → per-frame `.npy` preprocessor (`00_preprocess_data.py`) is kept for
+historical reference.
 
 ```bash
-python 00_preprocess_data.py --subject S4
-python 00_preprocess_data.py --subject S1 --base_dir /custom/path/S1
+python preprocess_from_skim.py --subjects S1 S2 S3 S4 S5   # residual npz -> per-frame .npy
+python pack_preprocessed.py    --subjects S1 S2 S3 S4 S5   # pack -> per-shot .npz
 ```
 
-Inputs (from `static00/{S}/raw/shot_{N}_captury/`):
-
-| File | Description |
-|------|-------------|
-| `{S}_shot_{N}.bvh` | Motion capture BVH (from 04-Blender) |
-| `{S}_residuals_shot_{N}_world_lbs_scaled_tpose.json` | Scaled marker residuals (from 04-Blender) |
-| `{S}_masked_residuals_shot_{N}_world_tpose.json` | Per-frame visibility masks (from 04-Blender) |
-| `{S}_canonical_markers_lbs_shot_{N}_exported_tpose.json` | LBS-deformed canonical markers (from 04-Blender) |
-
-Also requires (from `static00/{S}/canonical_model/`):
-- `{S}_canonical_data_tpose.json` — T-pose marker positions
-- `generated_marker_barycentric_map.json` — marker → mesh vertex barycentric mapping
-
-Output: `static00/{S}/preprocessed_vFinal_clean/`
-
-```
-preprocessed_vFinal_clean/
-  pose_rotations/    # shot_{N}_frame_{FFFF}.npy   — (J*6,) flattened 6D rotation vectors
-  residuals/         # shot_{N}_frame_{FFFF}.npy   — (M, 3) marker residual vectors
-  masks/             # shot_{N}_frame_{FFFF}.npy   — (M,) visibility masks
-  canonical_lbs/     # shot_{N}_frame_{FFFF}.npy   — (M, 3) LBS-deformed canonical positions
-```
-
-> **Note on S1 BVH scale:** S1 BVH uses scale `1.0`; all other subjects use `0.001`.
-> This is handled automatically inside the script.
+> **Note on S1 BVH scale:** S1 BVH uses scale `1.0`; all other subjects use `0.001`
+> (handled automatically inside the scripts).
+</details>
 
 ---
 
@@ -95,7 +90,7 @@ SLURM config: `gpu20` partition, 1 GPU, 16 CPUs, 32 GB RAM, 2-day time limit.
 | `batch_size` | `128` | Batch size |
 | `weight_decay` | `0.0` | Adam weight decay |
 | `train_split` | `0.9` | 90/10 train/val split |
-| `preload_to_ram` | `False` | Load all `.npy` files to RAM for faster I/O |
+| `preload_to_ram` | `False` | Legacy per-frame mode only — preload `.npy` to RAM (packed `.npz` mode always loads into RAM) |
 | `overfit_single` | `False` | Debug: train on 1 frame only |
 | `overfit_multiple` | `False` | Debug: train on first 300 frames only |
 | `viz_enabled` | `False` | Enable live Viser visualization during training |
@@ -222,11 +217,8 @@ static00/{S}/
       {S}_masked_residuals_shot_{N}_world_tpose.json
       {S}_canonical_markers_lbs_shot_{N}_exported_tpose.json
 
-  preprocessed_vFinal_clean/          # Output of 00_preprocess_data.py
-    pose_rotations/
-    residuals/
-    masks/
-    canonical_lbs/
+  preprocessed_vFinal_clean/          # packed, training-ready (from the SKIM dataset)
+    shot_{N}.npz                      # pose (F, J*6), residuals (F, M, 3), masks (F, M)
 
   canonical_model/
     {S}_canonical_data_tpose.json
@@ -257,7 +249,7 @@ static00/{S}/
     09_architectures/                 # Architecture ablations (Linear, MLP, UNet)
     10_priors/                        # Prior ablations (no_smooth_tan, no_physics, etc.)
   runs/                               # TensorBoard logs
-  {S}_validation_filepaths.json       # Paths to held-out .npy frames for validation
+  {S}_validation_filepaths.json       # Held-out frame ids for the 90/10 split (regenerated on first run)
 ```
 
 ---

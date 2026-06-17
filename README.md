@@ -112,7 +112,7 @@ Blender scenes, generated meshes) is **not** tracked — see [`.gitignore`](.git
 | 2 | `02-Canonical-Model/` | Build the canonical (rest-pose) marker model; UV marker detection & annotation | [README](02-Canonical-Model/README.md) |
 | 3 | `03-Registration/` | Compute marker Linear Blend Skinning (LBS) weights against the canonical model | [README](03-Registration/README.md) |
 | 4 | `04-Blender/` | Blender tooling: markers, residuals, Laplacian/dense deformation, reconstruction | [README](04-Blender/README.md) |
-| 5 | `05-Training/` | Preprocess data, train the deformation network, validate, evaluate, visualize | [README](05-Training/README.md) |
+| 5 | `05-Training/` | Train the deformation network on the SKIM data, validate, evaluate, visualize | [README](05-Training/README.md) |
 | 6 | `06-Evaluation/` | Biomechanical evaluation (muscle/skin intersection, volume stability), SMPL alignment | — |
 
 ---
@@ -147,22 +147,29 @@ Blender scenes, generated meshes) is **not** tracked — see [`.gitignore`](.git
 
 ## Data Preparation
 
-Per-subject SKIM data (subjects S1–S5) is not included in this repository. Each subject
-provides:
+The per-subject SKIM data (subjects S1–S5) is released as a separate download (see **Data**
+above) and is **not** included in this repository. The dataset is self-contained and
+training-ready; per subject it provides:
 
-- `preprocessed_vFinal_clean/` — processed training frames
-  (`pose_rotations/`, `residuals/`, `masks/`, `canonical_lbs/`)
-- `canonical_model/` — rest-pose mesh
-- `validation/` — held-out evaluation sequences
+- `<S>/canonical.npz` — canonical markers, bind markers, marker-LBS weights, joint names
+- `<S>/shot_XXX.npz` — per-shot residuals (`residual_m` / `residual_scaled`), visibility mask,
+  pose, and the per-shot rigid alignment
+- `<S>/preprocessed_vFinal_clean/<shot>.npz` — packed, training-ready frames
+  (`pose` `(F, J*6)`, `residuals` `(F, M, 3)`, `masks` `(F, M)`)
+- `<S>/layers/{tpose,apose}/` — canonical skin / muscle / skeleton meshes
 
-The train/validation split is 90/10; validation frame paths are stored in
-`05-Training/S{N}_validation_filepaths.json`.
+It also ships a loader (`skim_loader.py`), two Viser viewers, and its own `README.md` /
+`metadata.json` documenting every array and convention.
 
-Preprocess raw BVH / residual data into training tensors:
-```bash
-cd 05-Training
-python 00_preprocess_data.py
-```
+**To train, just point the training script at the downloaded dataset** (`PROCESSED_ROOT` in
+[`05-Training/01_end_to_end_training.py`](05-Training/01_end_to_end_training.py)); the data loader
+auto-detects the packed per-shot `.npz`, so **no separate preprocessing step is required**. The
+train/validation split is 90/10, regenerated and cached per subject in
+`05-Training/S{N}_validation_filepaths.json` on first run.
+
+The scripts that built the training tensors from the raw captures
+(`00_preprocess_data.py`, `preprocess_from_skim.py`, `pack_preprocessed.py`) are included for
+reproducibility only.
 
 ---
 
