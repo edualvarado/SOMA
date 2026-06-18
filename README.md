@@ -1,14 +1,13 @@
 <div align="center">
 
 ## SOMA: From Surface Observations to Muscle Anatomy
-<!-- TODO: venue & year once known -->
+**European Conference on Computer Vision (ECCV) 2026**
 
 [Eduardo Alvarado](https://edualvarado.com/)<sup>1</sup>, [Emily Kim](https://kimemily12.github.io/publications/)<sup>1</sup>, [Gerrit Nolte](https://cg.cs.tu-dortmund.de/people/nolte_gerrit.html)<sup>2</sup>, [Friedemann Runte](https://cg.cs.tu-dortmund.de/people/runte_friedemann.html)<sup>2</sup>, [Mario Botsch](https://ls7-gv.cs.tu-dortmund.de/people/botsch_mario.html)<sup>2</sup>, [Marc Habermann](https://people.mpi-inf.mpg.de/~mhaberma/)<sup>1</sup>, [Christian Theobalt](https://people.mpi-inf.mpg.de/~theobalt/)<sup>1</sup>
 
 <sup>1</sup> [Max Planck Institute for Informatics, Saarland Informatics Campus](https://www.mpi-inf.mpg.de/departments/visual-computing-and-artificial-intelligence) &nbsp;&nbsp; <sup>2</sup> [TU Dortmund University](https://www.tu-dortmund.de/en/)
 
-<!-- TODO: replace "(to be uploaded)" with real links when available -->
-[**Project page**](https://vcai.mpi-inf.mpg.de/projects/SOMA/) | [**Paper**](https://arxiv.org/abs/2606.09246) | **Video** *(to be uploaded)* | **Data** *(to be uploaded)*
+[**Project page**](https://vcai.mpi-inf.mpg.de/projects/SOMA/) | [**Paper**](https://arxiv.org/abs/2606.09246) | [**Video**](https://youtu.be/4EWyj6Ew9aw) | [**Data**](https://gvv-assets.mpi-inf.mpg.de/soma)
 
 <img src="docs/1.gif" alt="SOMA teaser" style="max-width: 100%;"/>
 
@@ -220,10 +219,11 @@ alignment to the SMPL body model (`smpl_alignment.py`). Visualization helpers ar
 If you use this project in your research, please cite:
 
 ```bibtex
-@misc{2026:alvarado:soma,
-  author = {Alvarado, Eduardo and Kim, Emily and Nolte, Gerrit and Runte, Friedemann and Botsch, Mario and Habermann, Marc and Theobalt, Christian},
-  title  = {SOMA: From Surface Observations to Muscle Anatomy},
-  year   = {2026},
+@inproceedings{2026:alvarado:soma,
+  author    = {Alvarado, Eduardo and Kim, Emily and Nolte, Gerrit and Runte, Friedemann and Botsch, Mario and Habermann, Marc and Theobalt, Christian},
+  title     = {SOMA: From Surface Observations to Muscle Anatomy},
+  booktitle = {European Conference on Computer Vision (ECCV)},
+  year      = {2026},
 }
 ```
 

@@ -80,6 +80,9 @@ def main():
                      for S, v in subjects.items())
     readme = f"""# SKIM marker residuals
 
+Part of **SOMA: From Surface Observations to Muscle Anatomy** (ECCV 2026).
+Project page: https://vcai.mpi-inf.mpg.de/projects/SOMA/ · Hosted at: https://gvv-assets.mpi-inf.mpg.de/soma
+
 Per-subject marker residuals (soft-tissue deviation from Linear Blend Skinning), regenerated in
 pure Python from BVH motion + canonical markers + triangulated mocap. No Blender.
 
@@ -129,6 +132,17 @@ residuals are the scaled GT (`residual_m * 0.1`).
 ## Reconstruct observed markers
 `observed ~= global_R @ LBS(p_bind, pose) + global_t + residual_m` (then rotate +90deg about X to Z-up).
 See `metadata.json["reconstruction"]`.
+
+## Citation
+If you use SKIM, please cite:
+```bibtex
+@inproceedings{{2026:alvarado:soma,
+  author    = {{Alvarado, Eduardo and Kim, Emily and Nolte, Gerrit and Runte, Friedemann and Botsch, Mario and Habermann, Marc and Theobalt, Christian}},
+  title     = {{SOMA: From Surface Observations to Muscle Anatomy}},
+  booktitle = {{European Conference on Computer Vision (ECCV)}},
+  year      = {{2026}},
+}}
+```
 """
     with open(f"{args.out}/README.md", "w") as f:
         f.write(readme)
