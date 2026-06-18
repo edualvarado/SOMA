@@ -30,7 +30,7 @@ import os, sys, glob, json, argparse
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, "/CT/SOMA/work/08-Residuals-Python")
+sys.path.insert(0, "/CT/SOMA/work/Residuals-Python")
 from pymotion.io.bvh import BVH
 import pymotion.rotations.quat as quat
 import pymotion.rotations.ortho6d as sixd

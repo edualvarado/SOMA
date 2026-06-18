@@ -20,7 +20,7 @@ Run:
 import os, sys, glob, argparse
 import numpy as np
 
-sys.path.insert(0, "/CT/SOMA/work/08-Residuals-Python")
+sys.path.insert(0, "/CT/SOMA/work/Residuals-Python")
 from pymotion.io.bvh import BVH
 import batch_residuals as B
 from preprocess_from_skim import pose6d_old_all, SKIM

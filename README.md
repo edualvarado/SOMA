@@ -102,7 +102,7 @@ visibility masks, and the full multi-layer anatomy for each subject.
 ## Repository structure
 
 This repository contains the **source code** for the full pipeline, organized into sequential
-stages; each stage has its own README. Bulk data (per-subject captures, model checkpoints,
+stages; most stages have their own README. Bulk data (per-subject captures, model checkpoints,
 Blender scenes, generated meshes) is **not** tracked — see [`.gitignore`](.gitignore).
 
 | Stage | Directory | What it does | Docs |
@@ -113,6 +113,10 @@ Blender scenes, generated meshes) is **not** tracked — see [`.gitignore`](.git
 | 4 | `04-Blender/` | Blender tooling: markers, residuals, Laplacian/dense deformation, reconstruction | [README](04-Blender/README.md) |
 | 5 | `05-Training/` | Train the deformation network on the SKIM data, validate, evaluate, visualize | [README](05-Training/README.md) |
 | 6 | `06-Evaluation/` | Biomechanical evaluation (muscle/skin intersection, volume stability), SMPL alignment | — |
+
+Alongside the numbered stages, **`Residuals-Python/`** holds the pure-Python residual pipeline (no
+Blender) that produces the released **SKIM** dataset — marker residual regeneration, marker
+relabeling, dataset finalization, and the Viser viewers.
 
 ---
 

@@ -166,7 +166,7 @@ def derive(S):
     costs = np.array([m["cost_cm"] for m in mapping.values()])
     print(f"[{S}] mapped {len(mapping)}/{len(proc_seen)} proc IDs ({ident} identical); "
           f"cost median={np.median(costs):.2f}cm p90={np.percentile(costs,90):.2f}cm", flush=True)
-    out = f"/CT/SOMA/work/08-Residuals-Python/relabel_{S}.json"
+    out = f"/CT/SOMA/work/Residuals-Python/relabel_{S}.json"
     json.dump({"map": mapping, "stats": stats}, open(out, "w"), indent=1)
     print(f"[{S}] wrote {out}", flush=True)
 

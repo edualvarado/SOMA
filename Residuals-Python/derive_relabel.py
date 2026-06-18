@@ -141,7 +141,7 @@ def derive(S):
     costs = np.array([m["cost_cm"] for m in mapping.values()])
     if len(costs):
         print(f"[{S}] mapping cost: median={np.median(costs):.2f}cm p90={np.percentile(costs,90):.2f}cm")
-    out = f"/CT/SOMA/work/08-Residuals-Python/relabel_{S}.json"
+    out = f"/CT/SOMA/work/Residuals-Python/relabel_{S}.json"
     with open(out, "w") as fo:
         json.dump({"map": mapping, "stats": stats}, fo, indent=1)
     print(f"[{S}] wrote {out}")
