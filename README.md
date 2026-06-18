@@ -223,7 +223,7 @@ alignment to the SMPL body model (`smpl_alignment.py`). Visualization helpers ar
 If you use this project in your research, please cite:
 
 ```bibtex
-@inproceedings{2026:alvarado:soma,
+@inproceedings{alvaradosoma2026,
   author    = {Alvarado, Eduardo and Kim, Emily and Nolte, Gerrit and Runte, Friedemann and Botsch, Mario and Habermann, Marc and Theobalt, Christian},
   title     = {SOMA: From Surface Observations to Muscle Anatomy},
   booktitle = {European Conference on Computer Vision (ECCV)},

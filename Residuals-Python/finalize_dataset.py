@@ -136,7 +136,7 @@ See `metadata.json["reconstruction"]`.
 ## Citation
 If you use SKIM, please cite:
 ```bibtex
-@inproceedings{{2026:alvarado:soma,
+@inproceedings{{alvaradosoma2026,
   author    = {{Alvarado, Eduardo and Kim, Emily and Nolte, Gerrit and Runte, Friedemann and Botsch, Mario and Habermann, Marc and Theobalt, Christian}},
   title     = {{SOMA: From Surface Observations to Muscle Anatomy}},
   booktitle = {{European Conference on Computer Vision (ECCV)}},
