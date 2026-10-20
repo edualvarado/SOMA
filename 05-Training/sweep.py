@@ -191,8 +191,8 @@ RUNS["DI_5cm"] = ("unet", ["--drop-inconsistent", "0.05"])
 # K1 + --drop-isolated + --unobs-normal (w_unobs 1e4) + --drop-inconsistent 0.05 + --forearm-detwist (auto: S2-S5)
 # + rebuilt rigs (rigs/<S>_rig.npz; S4 rebuilt after the layer fix) + LAYER_REST_OFFSET (S4) + global_R in every packed shot
 RUNS["RELEASE"] = ("unet", ["--seed", "0"])
-# 2026-10-13: RELEASE retrained on SKIM V2 (build_skim_v2.py: rig, de-twist, S4 layers baked in; fixes the S2-S5 forearm
-# target bias of the V1 conversion, S3 shot_005/008 poses). Same config; SKIM_ROOT = the V2 dataset, --subjects S1,S2,S3,S4,S5 --epochs 40.
+# 2026-10-13: RELEASE retrained on SKIM v2 (build_skim_v2.py: rig, de-twist, S4 layers baked in; fixes the S2-S5 forearm
+# target bias of the v1 conversion, S3 shot_005/008 poses). Same config; SKIM_ROOT = the v2 dataset, --subjects S1,S2,S3,S4,S5 --epochs 40.
 RUNS["RELEASE_V2"] = ("unet", ["--seed", "0"])
 
 METRICS = {  # csv column -> regex on the 03 report (SOMA, LBS)

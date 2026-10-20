@@ -1,16 +1,16 @@
 """
-verify_skim_v2.py -- check a SKIM V2 build (build_skim_v2.py) against its V1 source.
+verify_skim_v2.py -- check a SKIM v2 build (build_skim_v2.py) against its v1 source.
 
-  1. files: everything outside the intended changes is byte-identical to V1
-  2. observed markers: global_R @ LBS + global_t + residual_m is the same with the V1 and the V2 keys (every frame)
-  3. packed files: residuals == residual_scaled, masks, global_R, pose_raw == V1 pose, pose == pose6d (non-root joints)
+  1. files: everything outside the intended changes is byte-identical to v1
+  2. observed markers: global_R @ LBS + global_t + residual_m is the same with the v1 and the v2 keys (every frame)
+  3. packed files: residuals == residual_scaled, masks, global_R, pose_raw == v1 pose, pose == pose6d (non-root joints)
   4. weights: no zero rows; the skin JSON parses (by bone name) to the npy; marker W = barycentric blend of the npy
   5. S4 inner meshes: moved onto the skin (shared head vertices), non-vertex lines unchanged
-  6. poses: the V2 pose on the rig skeleton gives the same posed skeleton as the raw pose on the shot's own BVH skeleton
+  6. poses: the v2 pose on the rig skeleton gives the same posed skeleton as the raw pose on the shot's own BVH skeleton
      (up to the rig's refitted bone lengths), i.e. no rest-convention mix-up
-  7. training targets: V2 packed target vs 01's V1 conversion, per-frame centred (informational: the conversion biases)
+  7. training targets: v2 packed target vs 01's v1 conversion, per-frame centred (informational: the conversion biases)
 
-Run (from 05-Training/):  python verify_skim_v2.py --v1 <V1 dataset dir> --v2 <V2 dir>
+Run (from 05-Training/):  python verify_skim_v2.py --v1 <v1 dataset dir> --v2 <v2 dir>
 """
 import os, sys, glob, json, hashlib, argparse
 import numpy as np
@@ -78,7 +78,7 @@ def main():
     f1 = {os.path.relpath(p, v1).replace("\\", "/") for p in glob.glob(f"{v1}/**/*", recursive=True) if os.path.isfile(p)}
     f2 = {os.path.relpath(p, v2).replace("\\", "/") for p in glob.glob(f"{v2}/**/*", recursive=True) if os.path.isfile(p)}
     added = {f"{S}/canonical_model/{S}_rig.npz" for S in a.subjects}
-    check(f1 | added == f2, f"same file set + the rigs ({len(f2)} files){'' if f1 | added == f2 else f': only V1 {sorted(f1 - f2)[:5]}, only V2 {sorted(f2 - f1 - added)[:5]}'}")
+    check(f1 | added == f2, f"same file set + the rigs ({len(f2)} files){'' if f1 | added == f2 else f': only v1 {sorted(f1 - f2)[:5]}, only v2 {sorted(f2 - f1 - added)[:5]}'}")
     changed = {"metadata.json"}
     for S in a.subjects:
         changed |= expected_changes(S)
@@ -90,7 +90,7 @@ def main():
     diff = [p for p in same if os.path.getsize(f"{v1}/{p}") != os.path.getsize(f"{v2}/{p}") or sha(f"{v1}/{p}") != sha(f"{v2}/{p}")]
     check(not diff, f"{len(same)} unchanged files byte-identical{'' if not diff else f': differ {diff[:5]}'}")
     nochange = [p for p in sorted(changed & f1) if sha(f"{v1}/{p}") == sha(f"{v2}/{p}")]
-    check(not nochange, f"{len(changed & f1)} intended changes all differ from V1{'' if not nochange else f': unchanged {nochange[:5]}'}")
+    check(not nochange, f"{len(changed & f1)} intended changes all differ from v1{'' if not nochange else f': unchanged {nochange[:5]}'}")
     meta = json.load(open(f"{v2}/metadata.json"))
     check(meta.get("dataset_version") == 2, "metadata.json dataset_version == 2")
 
@@ -129,7 +129,7 @@ def main():
                 mu1, mu2 = obj_v(f"{v1}/{S}/layers/{pose}/musc_layer-{S}-{PP}.obj"), obj_v(f"{v2}/{S}/layers/{pose}/musc_layer-{S}-{PP}.obj")
                 check(np.abs(mu2 - mu1 - t).max() < 1.5e-6, f"{pose} musc_layer moved by t (max err {np.abs(mu2 - mu1 - t).max():.1e})")
                 n_shared = int((np.abs(sk - mu2).max(1) < 2e-6).sum())
-                check(n_shared > 6000, f"{pose} musc_layer shares {n_shared} vertices with the skin (V1: {int((np.abs(sk - mu1).max(1) < 2e-6).sum())})")
+                check(n_shared > 6000, f"{pose} musc_layer shares {n_shared} vertices with the skin (v1: {int((np.abs(sk - mu1).max(1) < 2e-6).sum())})")
             for p in glob.glob(f"{v2}/{S}/layers/*/*.obj") + glob.glob(f"{v2}/{S}/layers/tpose/muscle_meshes_tpose/*.obj"):
                 q = p.replace(v2, v1)
                 l1 = [l for l in open(q) if not l.startswith("v ")]; l2 = [l for l in open(p) if not l.startswith("v ")]
@@ -168,7 +168,7 @@ def main():
                 c_off = torch.from_numpy(d2["root_offset"].astype(np.float64)).to(DEV)
                 Mr = torch.from_numpy(d2["pose_rest_rotation"].astype(np.float64)).to(DEV)
                 root_pred = torch.from_numpy(d1["root_position"][sl].astype(np.float64)).to(DEV) - (R1[:, 0] @ Mr @ c_off.unsqueeze(-1)).squeeze(-1)
-                # [6] posed skeleton: raw pose on the shot's BVH skeleton vs V2 pose on the rig (rotated by M), root-aligned
+                # [6] posed skeleton: raw pose on the shot's BVH skeleton vs v2 pose on the rig (rotated by M), root-aligned
                 own = fk(R1, j1, parents)
                 e_fk = max(e_fk, (own - fk(R2, j2, parents)).norm(dim=-1).max().item())   # G_rig = G_own M, own offsets = M o
                 e_root = max(e_root, (root_pred - torch.from_numpy(d2["root_position"][sl].astype(np.float64)).to(DEV)).abs().max().item())
@@ -179,7 +179,7 @@ def main():
                 # packed pose: same local rotations as pose6d except the root (Z-up fix)
                 Rp = sixd_cols_to_R(torch.from_numpy(p2["pose"][sl].astype(np.float64)).to(DEV).view(B, -1, 6))
                 e_pk = max(e_pk, (Rp[:, 1:] - R2[:, 1:]).abs().max().item())
-                # training target (model frame, stored units): V2 vs 01's V1 conversion
+                # training target (model frame, stored units): v2 vs 01's v1 conversion
                 Rp1 = sixd_cols_to_R(torch.from_numpy(p1["pose"][sl].astype(np.float64)).to(DEV).view(B, -1, 6))
                 z = torch.zeros(B, 3, dtype=torch.float64, device=DEV)
                 r1 = torch.from_numpy(d1["residual_scaled"][sl].astype(np.float64)).to(DEV) @ gR @ R2M.to(DEV).T
@@ -190,11 +190,11 @@ def main():
                 dt = dt - dt.sum(1, keepdim=True) / m.sum(1, keepdim=True).clamp(min=1).unsqueeze(-1)   # training centres per frame
                 e_tgt.append(dt.norm(dim=-1)[m].cpu().numpy())
         e_tgt = np.concatenate(e_tgt) * 1000
-        check(e_obs <= 1.0, f"observed markers identical V1 vs V2 over {n_obs} observations (max error / float16 bound {e_obs:.2f})")
-        check(e_fk < 0.15, f"posed skeleton V2-on-rig vs raw-on-BVH, root-aligned: max {e_fk * 1000:.0f} mm (rig bone-length refit)")
+        check(e_obs <= 1.0, f"observed markers identical v1 vs v2 over {n_obs} observations (max error / float16 bound {e_obs:.2f})")
+        check(e_fk < 0.15, f"posed skeleton v2-on-rig vs raw-on-BVH, root-aligned: max {e_fk * 1000:.0f} mm (rig bone-length refit)")
         check(e_root < 1e-5, f"root_position == root_position_raw - R_root @ root_offset (max {e_root:.1e})")
         check(e_pk < 1e-5, f"packed pose == pose6d on non-root joints (max {e_pk:.1e})")
-        print(f"  INFO V2 target vs 01's V1 conversion (centred): mean {e_tgt.mean():.2f} p99 {np.percentile(e_tgt, 99):.2f} max {e_tgt.max():.2f} mm", flush=True)
+        print(f"  INFO v2 target vs 01's v1 conversion (centred): mean {e_tgt.mean():.2f} p99 {np.percentile(e_tgt, 99):.2f} max {e_tgt.max():.2f} mm", flush=True)
     print("ALL OK" if ok else "FAILURES (see above)")
     sys.exit(0 if ok else 1)
 

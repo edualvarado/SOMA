@@ -17,8 +17,8 @@
 
 ## News
 
-- **2026-10-20: SOMA v2 released.** SKIM V2 dataset (rebuilt rigs, fixed hands, poses and marker maps) and
-  pretrained SOMA models for S1–S5 (`RELEASE_V2`, trained on SKIM V2). If you downloaded SKIM before, please
+- **2026-10-20: SOMA v2 released.** SKIM v2 dataset (rebuilt rigs, fixed hands, poses and marker maps) and
+  pretrained SOMA models for S1–S5 (`RELEASE_V2`, trained on SKIM v2). If you downloaded SKIM before, please
   download it again (see [Data Preparation](#data-preparation)).
 
 ## Abstract
@@ -159,9 +159,9 @@ relabeling, dataset finalization, and the Viser viewers.
 
 ## Data Preparation
 
-> **Current release: SKIM V2** (`metadata.json` → `dataset_version: 2`) together with the pretrained
-> SOMA models in `SOMA_checkpoints.tar`, which were trained on it. If you downloaded SKIM before V2,
-> please download it again: V2 fixes the rig, poses and marker maps of V1 (see the dataset README).
+> **Current release: SKIM v2** (`metadata.json` → `dataset_version: 2`) together with the pretrained
+> SOMA models in `SOMA_checkpoints.tar`, which were trained on it. If you downloaded SKIM before v2,
+> please download it again: v2 fixes the rig, poses and marker maps of v1 (see the dataset README).
 
 The per-subject SKIM data (subjects S1–S5) is released as a separate download (see **Data**
 above) and is **not** included in this repository. The dataset is self-contained and
@@ -216,7 +216,7 @@ python sweep.py --only RELEASE_V2 --subjects S1,S2,S3,S4,S5 --epochs 40   # rele
 sbatch 01_end_to_end_training_job.sh --subject S1 --epochs 40
 ```
 
-**Pretrained models** for S1–S5 (`RELEASE_V2`, trained on SKIM V2) ship with the dataset (`SOMA_checkpoints.tar`); extract it into
+**Pretrained models** for S1–S5 (`RELEASE_V2`, trained on SKIM v2) ship with the dataset (`SOMA_checkpoints.tar`); extract it into
 `05-Training/` (`tar -xf SOMA_checkpoints.tar -C 05-Training`).
 
 > **Note:** retraining with `sweep.py --only RELEASE_V2` (or `--tag RELEASE_V2_e40`) writes the same file

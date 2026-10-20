@@ -68,15 +68,15 @@ CONFIG = {
 # Add new entries below. Change ACTIVE_CHECKPOINT to switch between them.
 
 CHECKPOINTS = {
-    # Released model (SOMA_checkpoints.tar): UNet, SKIM V2, 40 epochs, seed 0. Needs the V2 dataset as root.
+    # Released model (SOMA_checkpoints.tar): UNet, SKIM v2, 40 epochs, seed 0. Needs the v2 dataset as root.
     "release_v2_e40": {
         "path": f"./checkpoints/{CONFIG['subject']}_ABLATION_UNET_RELEASE_V2_e40_best_data.pth",
         "result": "see README.md, Released model",
         "marker_offset": True,
-        "rig": "dataset",  # <root>/<S>/canonical_model/<S>_rig.npz (shipped with SKIM V2)
+        "rig": "dataset",  # <root>/<S>/canonical_model/<S>_rig.npz (shipped with SKIM v2)
         "rigid_correction": True,
         "static_canon": f"./checkpoints/{CONFIG['subject']}_static_canon_RELEASE_V2_e40.npy",
-        "forearm_detwist": CONFIG["subject"] != "S1",  # raw-BVH input only; V2 packed poses are already de-twisted
+        "forearm_detwist": CONFIG["subject"] != "S1",  # raw-BVH input only; v2 packed poses are already de-twisted
     },
 }
 
@@ -112,7 +112,7 @@ _parser.add_argument("--data-root", default=os.environ.get("SKIM_ROOT"),
 DATA_ROOT = _parser.parse_args().data_root
 if not DATA_ROOT:
     _parser.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
-# SKIM V2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
+# SKIM v2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
 _meta = os.path.join(DATA_ROOT, "metadata.json")
 SKIM_VERSION = json.load(open(_meta)).get("dataset_version", 1) if os.path.exists(_meta) else 1
 if SKIM_VERSION >= 2:
@@ -2047,7 +2047,7 @@ def main():
         static_canon = torch.from_numpy(np.load(static_canon)).float().to(device) if static_canon else None
         marker_weights = (model.bary_weights.unsqueeze(-1) * model.skin_weights[model.bary_verts]).sum(1)
         rig_old = None
-        if RIG_PATH and SKIM_VERSION < 2:  # V1 residuals were measured against the original marker LBS: the overlay converts them to the new rig
+        if RIG_PATH and SKIM_VERSION < 2:  # v1 residuals were measured against the original marker LBS: the overlay converts them to the new rig
             _canon = np.load(os.path.join(PATHS['canonical'], "..", "canonical.npz"))
             rig_old = (torch.from_numpy(_canon["W"]).float().to(device), torch.from_numpy(_rig["j_rest_captury"]).float().to(device))
 
@@ -2653,7 +2653,7 @@ def main():
 
             rot_mats = sixd_to_rotmat(rot6d_tensor_inf) # (B, J, 3, 3)
             rot6d_bvh = rot6d_tensor_inf  # the residuals were measured with this pose (original-rig LBS)
-            if FOREARM_DETWIST and not (SKIM_VERSION >= 2 and (VALIDATION_CLIPS or packed is not None)):  # V2 packed poses are already de-twisted
+            if FOREARM_DETWIST and not (SKIM_VERSION >= 2 and (VALIDATION_CLIPS or packed is not None)):  # v2 packed poses are already de-twisted
                 rot6d_tensor_inf = rotmat_to_sixd(detwist(rot_mats, model.j_rest, joint_names_global, model.parents))
                 rot_mats = sixd_to_rotmat(rot6d_tensor_inf)
             

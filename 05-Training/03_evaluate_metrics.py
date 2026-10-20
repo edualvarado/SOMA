@@ -1428,7 +1428,7 @@ def main():
     parser.add_argument(
         "--rig", type=str, default="auto",
         help="Rebuilt rig from build_rig.py (rest joints + skin weights), as the checkpoint was trained with 01 --rig. "
-             "'auto' = <root>/<S>/canonical_model/<S>_rig.npz on SKIM V2, else rigs/<S>_rig.npz; "
+             "'auto' = <root>/<S>/canonical_model/<S>_rig.npz on SKIM v2, else rigs/<S>_rig.npz; "
              "'none' = the original Captury rig and weights."
     )
     parser.add_argument(
@@ -1464,12 +1464,12 @@ def main():
 
     SUBJECT         = args.subject
     RIG_PATH        = {"auto": os.path.join("rigs", f"{SUBJECT}_rig.npz"), "none": None}.get(args.rig, args.rig)
-    # SKIM V2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
+    # SKIM v2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
     _meta = os.path.join(args.data_root, "metadata.json")
     skim_version = json.load(open(_meta)).get("dataset_version", 1) if os.path.exists(_meta) else 1
     if skim_version >= 2:
         if not RIG_PATH:
-            parser.error("SKIM V2 residuals are referenced to the rebuilt rig: --rig none is not supported")
+            parser.error("SKIM v2 residuals are referenced to the rebuilt rig: --rig none is not supported")
         if args.rig == "auto":  # the rig shipped with the dataset
             RIG_PATH = os.path.join(args.data_root, SUBJECT, "canonical_model", f"{SUBJECT}_rig.npz")
         args.forearm_detwist = False  # packed poses already de-twisted
@@ -2408,7 +2408,7 @@ def main():
     static_canon = torch.from_numpy(np.load(args.static_canon)).float().to(device) if args.static_canon else None
     marker_weights = (model.bary_weights.unsqueeze(-1) * model.skin_weights[model.bary_verts]).sum(1)
     rig_old = None
-    if RIG_PATH and args.posed_data and skim_version < 2:  # V1 residuals were measured against the original marker LBS: convert to the new rig
+    if RIG_PATH and args.posed_data and skim_version < 2:  # v1 residuals were measured against the original marker LBS: convert to the new rig
         _canon = np.load(os.path.join(PATHS['canonical'], "..", "canonical.npz"))
         if [str(m) for m in _canon["marker_ids"]] != [str(m) for m in canonical_marker_ids]:
             raise ValueError("canonical.npz marker order differs from the evaluation marker order")

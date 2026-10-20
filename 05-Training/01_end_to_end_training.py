@@ -1177,7 +1177,7 @@ _parser.add_argument("--rigid-correction", action=argparse.BooleanOptionalAction
                           "physics on it). Needs --posed-data. Prior weight: --w w_rigid=X (default 1)")
 _parser.add_argument("--rig", default="auto",
                      help="Rebuilt rig from build_rig.py (rest joints refitted to the bones + bone-heat skin weights). "
-                          "'auto' = <root>/<S>/canonical_model/<S>_rig.npz on SKIM V2, else rigs/<S>_rig.npz; "
+                          "'auto' = <root>/<S>/canonical_model/<S>_rig.npz on SKIM v2, else rigs/<S>_rig.npz; "
                           "'none' = the original Captury rig and weights")
 _parser.add_argument("--drop-isolated", action=argparse.BooleanOptionalAction, default=True,
                      help="Drop observed markers with fewer than 2 of their 8 nearest markers observed in that frame "
@@ -1247,12 +1247,12 @@ RESIDUAL_STATIC_REMOVAL = _args.residual_static_removal
 RUN_TAG = _args.tag or ACTIVE_PRESET
 if not DATA_ROOT:
     _parser.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
-# SKIM V2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
+# SKIM v2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
 _meta = os.path.join(DATA_ROOT, "metadata.json")
 SKIM_VERSION = json.load(open(_meta)).get("dataset_version", 1) if os.path.exists(_meta) else 1
 if SKIM_VERSION >= 2:
     if not RIG_PATH:
-        _parser.error("SKIM V2 residuals are referenced to the rebuilt rig: --rig none is not supported")
+        _parser.error("SKIM v2 residuals are referenced to the rebuilt rig: --rig none is not supported")
     if _args.rig == "auto":  # the rig shipped with the dataset
         RIG_PATH = os.path.join(DATA_ROOT, CONFIG['subject'], "canonical_model", f"{CONFIG['subject']}_rig.npz")
     FOREARM_DETWIST = False  # poses already de-twisted

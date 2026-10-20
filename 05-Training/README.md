@@ -11,7 +11,7 @@ The released models (`RELEASE_V2`) are described in [Released model](#released-m
 ## Pipeline Overview
 
 ```
-[SKIM dataset V2 at $SKIM_ROOT (or --data-root), per subject <root>/{S}/]
+[SKIM dataset v2 at $SKIM_ROOT (or --data-root), per subject <root>/{S}/]
   preprocessed_vFinal_clean/   ← packed per-shot .npz (training-ready; no preprocessing needed)
   canonical_model/{S}_rig.npz  ← SOMA rig (rest joints + skin weights)
         |
@@ -40,10 +40,10 @@ The released models (`RELEASE_V2`) are described in [Released model](#released-m
 | `02_validate_training.py` | Viser viewer; checkpoint table `CHECKPOINTS` at the top |
 | `03_evaluate_metrics.py` | Held-out metrics (marker error, intersections, volume, roughness) |
 | `sweep.py` | Named runs (`RUNS`): 01 + 03 per subject, results to `sweep_results.csv` |
-| `forearm_detwist.py` | Removes the spurious Captury ForeArm twist (S2–S5); used by 01/02/03 and the V2 build |
+| `forearm_detwist.py` | Removes the spurious Captury ForeArm twist (S2–S5); used by 01/02/03 and the v2 build |
 | `muscle_binding.py` | Binds the individual muscle meshes to the muscle layer (Gaussian blend of the nearest layer vertices) and transfers its displacement; used by 02 (replaces the dataset's `individual_muscle_to_skin_binding.json`) |
 | `build_rig.py` | Builds the SOMA rig: rest joints refitted to the bones + bone-heat skin weights (`rigs/{S}_rig.npz`) |
-| `build_skim_v2.py`, `verify_skim_v2.py` | Build SKIM V2 from V1 (rig, de-twist, root, alignment and layer fixes baked in) and verify it |
+| `build_skim_v2.py`, `verify_skim_v2.py` | Build SKIM v2 from v1 (rig, de-twist, root, alignment and layer fixes baked in) and verify it |
 | `preprocess_from_skim.py`, `pack_preprocessed.py` | Rebuild the packed training tensors from the residual npz (reproducibility only) |
 | `00_preprocess_data.py` | Original Blender-JSON preprocessor (historical reference) |
 | `{S}_validation_filepaths.json` | Train/validation split per subject (whole held-out shots) |
@@ -66,8 +66,8 @@ export SKIM_ROOT=/path/to/SKIM_dataset   # or pass --data-root /path/to/SKIM_dat
 
 `01`, `02`, `03`, `preprocess_from_skim.py` and `pack_preprocessed.py` all read `--data-root`, falling
 back to `$SKIM_ROOT`, and exit with an error if neither is set. 01/02/03 read `dataset_version` from
-`<root>/metadata.json`: on V2 the rig, de-twist and layer fixes are already in the data; on V1 they are
-applied at load time (see [SKIM V2 vs V1](#skim-v2-vs-v1)).
+`<root>/metadata.json`: on v2 the rig, de-twist and layer fixes are already in the data; on v1 they are
+applied at load time (see [SKIM v2 vs v1](#skim-v2-vs-v1)).
 
 <details>
 <summary>Rebuilding the training tensors (reproducibility only)</summary>
@@ -75,8 +75,8 @@ applied at load time (see [SKIM V2 vs V1](#skim-v2-vs-v1)).
 The packed frames are derived from the SKIM residual `.npz` (`<S>/shot_XXX.npz`):
 `preprocess_from_skim.py` reconstructs the BVH pose in the training 6D convention and pairs it with
 the scaled residuals + masks, then `pack_preprocessed.py` bundles each shot into one `.npz`.
-SKIM V2 itself is built from V1 with `build_skim_v2.py` and checked with `verify_skim_v2.py`
-(see [SKIM V2 vs V1](#skim-v2-vs-v1)).
+SKIM v2 itself is built from v1 with `build_skim_v2.py` and checked with `verify_skim_v2.py`
+(see [SKIM v2 vs v1](#skim-v2-vs-v1)).
 
 ```bash
 python preprocess_from_skim.py --subjects S1 S2 S3 S4 S5   # residual npz -> per-frame .npy
@@ -98,7 +98,7 @@ tar -xf SOMA_checkpoints.tar -C 05-Training
 
 ### Released model (`RELEASE_V2`)
 
-One UNet per subject (same architecture and configuration for all subjects), trained on SKIM V2 for
+One UNet per subject (same architecture and configuration for all subjects), trained on SKIM v2 for
 40 epochs with seed 0. It is the `RELEASE_V2` run in `sweep.py`, i.e. the defaults of 01 plus `--seed 0`:
 
 | Setting | Value |
@@ -124,10 +124,10 @@ markers; P90 is over all markers, where unobserved markers score 0 for LBS by co
 
 The released model differs from the paper model (preset `paper_final`, MLP).
 
-#### SKIM V2 vs V1
+#### SKIM v2 vs v1
 
-SKIM V2 is derived from V1 with these fixes baked into the data. 01/02/03 read `dataset_version` from
-`metadata.json` and, on V1, apply the equivalent fixes at load time.
+SKIM v2 is derived from v1 with these fixes baked into the data. 01/02/03 read `dataset_version` from
+`metadata.json` and, on v1, apply the equivalent fixes at load time.
 
 - **Rig:** rest joints refitted to the bone contacts and bone-heat skin weights (no zero-weight hand
   vertices); marker weights are the barycentric blend of the skin weights.
@@ -175,7 +175,7 @@ SLURM config: `gpu20` partition, 1 GPU, 16 CPUs, 32 GB RAM, 2-day time limit.
 | `--preset` | `soma_final` | Loss-weight preset from `LAMBDAS_PRESETS` |
 | `--tag` | preset name | Run name used in checkpoint / log names |
 | `--seed` | `0` | Random seed |
-| `--rig` | `auto` | `auto` = `<root>/<S>/canonical_model/<S>_rig.npz` on V2, else `rigs/<S>_rig.npz`; `none` = original rig |
+| `--rig` | `auto` | `auto` = `<root>/<S>/canonical_model/<S>_rig.npz` on v2, else `rigs/<S>_rig.npz`; `none` = original rig |
 
 On Windows keep `num_workers = 0` (the dataset is held in RAM and cannot be pickled to worker processes).
 
@@ -278,7 +278,7 @@ $SKIM_ROOT/{S}/
   preprocessed_vFinal_clean/
     shot_{N}.npz                      # training form: pose (F, J*6), residuals (F, M, 3), masks (F, M), global_R
   canonical_model/
-    {S}_rig.npz                       # SOMA rig (V2)
+    {S}_rig.npz                       # SOMA rig (v2)
     generated_marker_barycentric_map.json
     lbs_skin/{S}_skin_lbs_weights_exported.npy
     ...

@@ -106,7 +106,7 @@ def bone_correction(cache, T0, C, Q, f0, f1, smooth=9, min_markers=20, max_angle
     """Per-joint rigid corrections D (f1-f0+1, J, 4, 4) in the calibration frame that move SOMA's skin at the markers onto
     the triangulated markers Q: the body follows the capture's pose (Captury BVH), which is a few cm off per limb.
     Weighted Kabsch per joint (weights = skinning weights of each marker's skin vertex) where at least `min_markers`
-    markers belong mostly to the joint; the forearm twist is dropped (V2 removes it from the pose on purpose); joints
+    markers belong mostly to the joint; the forearm twist is dropped (v2 removes it from the pose on purpose); joints
     without a fit, or whose fit turns more than `max_angle` deg from their parent's, take the parent's; smoothed over
     `smooth` frames. T0: model -> dataset capture world, C: capture correction."""
     S = np.load(os.path.join(cache, "static.npz"))
