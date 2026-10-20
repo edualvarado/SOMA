@@ -15,6 +15,12 @@
 
 ---
 
+## News
+
+- **2026-10-20: SOMA v2 released.** SKIM V2 dataset (rebuilt rigs, fixed hands, poses and marker maps) and
+  pretrained SOMA models for S1–S5 (`RELEASE_V2`, trained on SKIM V2). If you downloaded SKIM before, please
+  download it again (see [Data Preparation](#data-preparation)).
+
 ## Abstract
 
 With the growing demand for realistic virtual humans, parametric body models have become a
@@ -110,13 +116,15 @@ Blender scenes, generated meshes) is **not** tracked — see [`.gitignore`](.git
 | 1 | `01-Suit-Processing/` | 2D detection, triangulation & 3D tracking of suit markers; suit manufacturing toolkit | [README](01-Suit-Processing/README.md) |
 | 2 | `02-Canonical-Model/` | Build the canonical (rest-pose) marker model; UV marker detection & annotation | [README](02-Canonical-Model/README.md) |
 | 3 | `03-Registration/` | Compute marker Linear Blend Skinning (LBS) weights against the canonical model | [README](03-Registration/README.md) |
-| 4 | `04-Blender/` | Blender tooling: markers, residuals, Laplacian/dense deformation, reconstruction | [README](04-Blender/README.md) |
 | 5 | `05-Training/` | Train the deformation network on the SKIM data, validate, evaluate, visualize | [README](05-Training/README.md) |
-| 6 | `06-Evaluation/` | Biomechanical evaluation (muscle/skin intersection, volume stability), SMPL alignment | — |
+| 6 | `06-Evaluation/` | Biomechanical evaluation (muscle/skin intersection, volume stability), SMPL alignment | [README](06-Evaluation/README.md) |
 
 Alongside the numbered stages, **`Residuals-Python/`** holds the pure-Python residual pipeline (no
 Blender) that produces the released **SKIM** dataset — marker residual regeneration, marker
 relabeling, dataset finalization, and the Viser viewers.
+
+**`Showcase/`** is a real-time Blender viewer of the individual muscle deformation (see its
+[README](Showcase/README.md)).
 
 ---
 
@@ -126,7 +134,7 @@ relabeling, dataset finalization, and the Viser viewers.
 - **Python:** 3.9+
 - **PyTorch:** install the build matching your CUDA toolkit — see the
   [official guide](https://pytorch.org/get-started/locally/).
-- **Blender:** the scripts under `04-Blender/scripts/` run **inside Blender** and use its
+- **Blender:** the visualization scripts `05-Training/A_`–`H_*.py` run **inside Blender** and use its
   built-in Python API (`bpy`, `mathutils`, `bmesh`, `gpu`); these are not pip packages.
 
 ### Installation
@@ -137,11 +145,12 @@ relabeling, dataset finalization, and the Viser viewers.
      python -m venv env
      source env/bin/activate        # Windows: .\env\Scripts\activate
      ```
-3. Install dependencies:
+3. Install PyTorch according to your compute platform, **before** the other dependencies
+   (otherwise `pip` may install the CPU-only build from PyPI, e.g. on Windows).
+4. Install the remaining dependencies:
      ```bash
      pip install -r requirements.txt
      ```
-4. Install PyTorch according to your compute platform.
 
 > **Note:** versions in [`requirements.txt`](requirements.txt) are unpinned; the code was
 > developed against a specific CUDA/PyTorch stack on a SLURM cluster. Pin as needed.
@@ -149,6 +158,10 @@ relabeling, dataset finalization, and the Viser viewers.
 ---
 
 ## Data Preparation
+
+> **Current release: SKIM V2** (`metadata.json` → `dataset_version: 2`) together with the pretrained
+> SOMA models in `SOMA_checkpoints.tar`, which were trained on it. If you downloaded SKIM before V2,
+> please download it again: V2 fixes the rig, poses and marker maps of V1 (see the dataset README).
 
 The per-subject SKIM data (subjects S1–S5) is released as a separate download (see **Data**
 above) and is **not** included in this repository. The dataset is self-contained and
@@ -158,17 +171,28 @@ training-ready; per subject it provides:
 - `<S>/shot_XXX.npz` — per-shot residuals (`residual_m` / `residual_scaled`), visibility mask,
   pose, and the per-shot rigid alignment
 - `<S>/preprocessed_vFinal_clean/<shot>.npz` — packed, training-ready frames
-  (`pose` `(F, J*6)`, `residuals` `(F, M, 3)`, `masks` `(F, M)`)
+  (`pose` `(F, J*6)`, `residuals` `(F, M, 3)`, `masks` `(F, M)`, `global_R` `(3, 3)`)
 - `<S>/layers/{tpose,apose}/` — canonical skin / muscle / skeleton meshes
+- `<S>/canonical_model/` — canonical markers, barycentric map, skin/muscle LBS weights, and the
+  SOMA rig `<S>_rig.npz` (rest joints + skin weights). Its `individual_muscle_to_skin_binding.json` is
+  superseded: its triangle indices do not match the released meshes, and the code binds the individual
+  muscles to the muscle layer itself (`05-Training/muscle_binding.py`)
+- `<S>/raw/<shot>_captury/<S>_<shot>.bvh` — per-shot motion (BVH)
 
 It also ships a loader (`skim_loader.py`), two Viser viewers, and its own `README.md` /
 `metadata.json` documenting every array and convention.
 
-**To train, just point the training script at the downloaded dataset** (`PROCESSED_ROOT` in
-[`05-Training/01_end_to_end_training.py`](05-Training/01_end_to_end_training.py)); the data loader
-auto-detects the packed per-shot `.npz`, so **no separate preprocessing step is required**. The
-train/validation split is 90/10, regenerated and cached per subject in
-`05-Training/S{N}_validation_filepaths.json` on first run.
+**To train, just point the scripts at the downloaded dataset**, either with the `SKIM_ROOT`
+environment variable or the `--data-root` flag (the flag wins):
+
+```bash
+export SKIM_ROOT=/path/to/SKIM_dataset       # or: python <script>.py --data-root /path/to/SKIM_dataset
+```
+
+Every script resolves its inputs under `<root>/<S>/`. The data loader auto-detects the packed
+per-shot `.npz`, so **no separate preprocessing step is required**. The
+train/validation split holds out whole shots (~10 % of the frames) and is fixed per subject in
+`05-Training/S{N}_validation_filepaths.json`.
 
 The scripts that built the training tensors from the raw captures
 (`00_preprocess_data.py`, `preprocess_from_skim.py`, `pack_preprocessed.py`) are included for
@@ -178,16 +202,25 @@ reproducibility only.
 
 ## Training
 
-The architecture is selected via the `ARCH` variable in
-[`05-Training/01_end_to_end_training.py`](05-Training/01_end_to_end_training.py)
-(`"linear"`, `"mlp"`, or `"unet"`); loss weights live in the `LAMBDAS` dict in the same file.
+The defaults of [`05-Training/01_end_to_end_training.py`](05-Training/01_end_to_end_training.py) are the
+released configuration (UNet, preset `soma_final`); one model is trained per subject. The architecture
+(`--arch`: `linear`, `mlp`, `unet`) and loss weights (`LAMBDAS_PRESETS`, `--preset`) can be changed;
+evaluate with the same architecture (`CONFIG["architecture"]` in `02_validate_training.py`, `--arch` for
+`03_evaluate_metrics.py`). See [`05-Training/README.md`](05-Training/README.md).
 
 ```bash
 cd 05-Training
-python 01_end_to_end_training.py        # interactive
-# or, on a SLURM cluster:
-sbatch 01_end_to_end_training_job.sh
+python 01_end_to_end_training.py --subject S1 --epochs 40        # interactive
+python sweep.py --only RELEASE_V2 --subjects S1,S2,S3,S4,S5 --epochs 40   # released models (train + evaluate)
+# or, on a SLURM cluster (sbatch passes SKIM_ROOT through from your shell):
+sbatch 01_end_to_end_training_job.sh --subject S1 --epochs 40
 ```
+
+**Pretrained models** for S1–S5 (`RELEASE_V2`, trained on SKIM V2) ship with the dataset (`SOMA_checkpoints.tar`); extract it into
+`05-Training/` (`tar -xf SOMA_checkpoints.tar -C 05-Training`).
+
+> **Note:** retraining with `sweep.py --only RELEASE_V2` (or `--tag RELEASE_V2_e40`) writes the same file
+> names and replaces the pretrained checkpoints in `checkpoints/`; use another `--tag` to keep both.
 
 ### Loss terms
 
@@ -199,6 +232,8 @@ sbatch 01_end_to_end_training_job.sh
 | Spring energy | `w_spring_musc/skin` | Stretch resistance |
 | Tangential energy | `w_tangent_musc/skin` | Prevent normal sliding |
 | Volume preservation | `w_vol_musc/skin` | Prism volume loss (2-point Gauss quadrature) |
+| Crease | `w_crease_musc/skin` | Penalize folds |
+| Unobserved skin | `w_unobs` | Keep skin without markers close to LBS (along the normal) |
 
 ---
 
@@ -206,15 +241,16 @@ sbatch 01_end_to_end_training_job.sh
 
 ```bash
 cd 05-Training
-python 02_validate_training.py
-python 03_evaluate_metrics.py
-python ../06-Evaluation/hit_bio_evaluation.py     # muscle/skin intersection, volume stability
+python 02_validate_training.py                    # viewer; subject/shot/checkpoint at the top of the script
+python 03_evaluate_metrics.py --subject S1 --arch unet \
+    --checkpoint checkpoints/S1_ABLATION_UNET_RELEASE_V2_e40_best_data.pth
 ```
 
-`06-Evaluation/hit_bio_evaluation.py` computes the intersection ratio (% of muscle vertices
-penetrating skin), the volume coefficient of variation (frame-to-frame stability), and
-alignment to the SMPL body model (`smpl_alignment.py`). Visualization helpers are the
-`A_`–`H_` prefixed scripts in `05-Training/`.
+`03_evaluate_metrics.py` reports SOMA's metrics on the held-out shots: marker error (MPME-obs, P90, τ),
+muscle/fat intersections, volume variation and surface roughness. `06-Evaluation/` holds the scripts
+used to evaluate the HIT baseline for comparison (see its [README](06-Evaluation/README.md)).
+Visualization helpers are the `A_`–`H_` prefixed scripts in `05-Training/`. [`Showcase/`](Showcase/README.md)
+plays the input motion and the resulting individual muscle deformation (posed and canonical) in real time in Blender.
 
 ---
 

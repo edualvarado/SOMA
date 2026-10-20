@@ -16,13 +16,13 @@ run on the cluster.
         |
         | (copy to local)
         ↓
-  [Blender] 04-Blender/scripts/02_canonical_model/lbs_skin/07_export_lbs_weights_skin.py
+  [Blender] 07_export_lbs_weights_skin.py (not included)
         |          Exports per-vertex skin LBS weights from the rigged mesh
         |          → {subject}_skin_lbs_weights_exported.json
         |
         | (copy to cluster)
         ↓
-create_marker_LBS_weights_final.py       (Step 1 — cluster)
+create_marker_LBS_weights.py             (Step 1 — cluster)
         |   Transfers mesh vertex weights to marker corners via
         |   barycentric interpolation
         |   → {subject}_marker_lbs_weights_exported.json
@@ -30,7 +30,7 @@ create_marker_LBS_weights_final.py       (Step 1 — cluster)
 verify_marker_LBS_weights.py             (Step 2 — cluster, optional)
         |   Sanity-checks the output (normalization, no negatives, no empties)
         ↓
-  [Blender] 04-Blender/scripts/01_markers/03_visualize_LBS_markers.py
+  [Blender] 03_visualize_LBS_markers.py (not included)
                    Visualizes the marker weights on the mesh (optional)
 ```
 
@@ -40,7 +40,7 @@ verify_marker_LBS_weights.py             (Step 2 — cluster, optional)
 
 ### Step 1 — Export skin weights from Blender (local, manual)
 
-Open Blender and run `04-Blender/scripts/02_canonical_model/lbs_skin/07_export_lbs_weights_skin.py`.
+Open Blender and run `07_export_lbs_weights_skin.py` (Blender script, not included in this repository).
 
 This script exports per-vertex LBS weights from the rigged skin mesh into:
 ```
@@ -53,13 +53,13 @@ Also ensure the following are in place in `registration/{subject}/canonical_mode
 - `{subject}_canonical_data.json` — copied from `02-Canonical-Model` output
 - `skin_layer-{subject}-APose.obj` — the skin mesh exported from Blender in A-pose
 
-### Step 2 — Compute marker LBS weights (`create_marker_LBS_weights_final.py`)
+### Step 2 — Compute marker LBS weights (`create_marker_LBS_weights.py`)
 
 Transfers LBS weights from the mesh vertices to each marker corner using
 barycentric interpolation on the closest mesh triangle.
 
 ```bash
-python create_marker_LBS_weights_final.py --subject S1
+python create_marker_LBS_weights.py --subject S1
 ```
 
 Inputs (all under `registration/{subject}/canonical_model/` by default):
@@ -92,7 +92,7 @@ python verify_marker_LBS_weights.py \
 
 ### Step 4 — Visualize in Blender (local, optional)
 
-Run `04-Blender/scripts/01_markers/03_visualize_LBS_markers.py` locally in
+Run `03_visualize_LBS_markers.py` (Blender script, not included in this repository) locally in
 Blender to inspect the marker weights on the mesh.
 
 ---
@@ -105,21 +105,21 @@ registration/
     canonical_model/
       {subject}_canonical_data.json               # Copied from 02-Canonical-Model registration output.
                                                   # Marker 3D positions in A-pose, produced by
-                                                  # 04-Blender: build_canonical_model.py
+                                                  # Blender: build_canonical_model.py
 
       {subject}_canonical_data_tpose.json         # Marker 3D positions in T-pose world coordinates.
                                                   # Exported from Blender via
-                                                  # 04-Blender: 01_markers/A_export_new_canonical_data.py
+                                                  # Blender: A_export_new_canonical_data.py
 
       skin_layer-{subject}-APose.obj              # Skin mesh in A-pose.
                                                   # Exported directly from Blender.
 
       {subject}_skin_lbs_weights_exported.json    # Per-vertex LBS weights for the skin mesh.
                                                   # Exported from Blender via
-                                                  # 04-Blender: 02_canonical_model/lbs_skin/07_export_lbs_weights_skin.py
+                                                  # Blender: 07_export_lbs_weights_skin.py
 
       {subject}_marker_lbs_weights_exported.json  # Per-marker LBS weights (bone_indices, weights, bone_names).
-                                                  # Computed by create_marker_LBS_weights_final.py (this folder).
+                                                  # Computed by create_marker_LBS_weights.py (this folder).
 ```
 
 ---

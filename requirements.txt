@@ -18,9 +18,10 @@ av                     # PyAV, video IO
 
 # --- Deep learning ---
 torch                  # install the build matching your CUDA toolkit
+tensorboard            # torch.utils.tensorboard.SummaryWriter (training logs)
 
 # --- Motion / data ---
-pymotion
+upc-pymotion           # imported as `pymotion` (the PyPI package named `pymotion` is unrelated)
 
 # --- Visualization / reporting ---
 matplotlib
@@ -32,5 +33,5 @@ loguru
 tqdm
 
 # --- Blender Python API (bpy, mathutils, bmesh, gpu, gpu_extras) is NOT a pip
-#     dependency: those modules are provided by the Blender runtime. Scripts
-#     under 04-Blender/scripts/ are meant to be run inside Blender. ---
+#     dependency: those modules are provided by the Blender runtime. The
+#     05-Training/A_-H_*.py visualization scripts are meant to be run inside Blender. ---

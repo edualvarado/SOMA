@@ -12,8 +12,9 @@ from scipy.spatial import KDTree
 HEIGHT_ADJUSTMENT_METERS = -0.255 
 FRONT_ADJUSTMENT_METERS = 0.005
 
-HIT_TPOSE_MESH_PATH = Path(rf"/CT/SOMA/static00/frame_000000_tpose.obj")
-GT_BIND_MARKERS_PATH = Path(rf"/CT/SOMA/static00/S1/canonical_model/S1_canonical_data_tpose.json")
+STATIC = Path(os.environ.get("SOMA_STATIC", "static00"))  # raw capture working tree
+HIT_TPOSE_MESH_PATH = STATIC / "frame_000000_tpose.obj"
+GT_BIND_MARKERS_PATH = STATIC / "S1" / "canonical_model" / "S1_canonical_data_tpose.json"
 OUTPUT_MAP_PATH = Path("soma_to_smpl_barycentric_map.json")
 
 def _rot_x(points, deg=0.0):

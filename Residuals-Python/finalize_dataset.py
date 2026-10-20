@@ -2,7 +2,7 @@
 finalize_dataset.py -- scan the generated SKIM residual dataset and write metadata.json + README.md.
 
 Run after batch_residuals.py finishes:
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python finalize_dataset.py --out /CT/SOMA/static00/SKIM_dataset
+  python finalize_dataset.py --data-root /path/to/SKIM_dataset   # or set $SKIM_ROOT
 """
 import os, glob, json, argparse
 import numpy as np
@@ -16,8 +16,11 @@ SUBJ_NAME = {"S1": "S1-21-11-24", "S2": "S2-12-12-25", "S3": "S3-17-12-25",
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default="/CT/SOMA/static00/SKIM_dataset")
+    ap.add_argument("--data-root", "--out", dest="out", metavar="DIR", default=os.environ.get("SKIM_ROOT"),
+                    help="SKIM dataset root (default: $SKIM_ROOT)")
     args = ap.parse_args()
+    if not args.out:
+        ap.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
 
     subjects = {}
     for S in sorted(d for d in os.listdir(args.out) if os.path.isdir(f"{args.out}/{d}") and d.startswith("S")):

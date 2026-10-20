@@ -11,7 +11,7 @@ Per (subject, shot):
 
 Frame alignment (validated on S1): output frame i  <->  bvh frame i+1  <->  proc[i].
 
-Output tree (default /CT/SOMA/static00/SKIM_dataset):
+Output tree (--data-root / --out, else $SKIM_ROOT):
   metadata.json, README.md
   <S>/canonical.npz                 marker_ids, p_canon, p_bind, W, parents, joint_names
   <S>/<shot>.npz                    residual_m(f16), residual_scaled(f16), mask(u8),
@@ -19,7 +19,7 @@ Output tree (default /CT/SOMA/static00/SKIM_dataset):
                                     frame_index(=bvh frame), marker_ids
 
 Run (background):
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python batch_residuals.py            # all subjects
+  python batch_residuals.py            # all subjects
   ... batch_residuals.py --subjects S1 --validate                                 # S1 + compare to existing
 """
 import os, gc, json, glob, time, argparse
@@ -29,18 +29,21 @@ from pymotion.io.bvh import BVH
 from recreate_residuals import (quat_wxyz_to_matrix, lbs_frame, rot_x,
                                  DEGREE_BVH_X, SCALE_FACTOR)
 
-STATIC = "/CT/SOMA/static00"
+STATIC = os.environ.get("SOMA_STATIC", "static00")  # raw capture working tree (not part of the released dataset)
 DATA = f"{STATIC}/data"
-OUT_DEFAULT = "/CT/SOMA/static00/SKIM_dataset"
 
-# subject -> data dir name; bvh path builder differs for S1
+# subject -> data dir name; bvh path builder differs for S1. Local capture dir names that differ from
+# these go in an untracked raw_dirs.json next to this script ({"S2": "<dir>", ...}).
 SUBJECTS = {
     "S1": "S1-21-11-24",
-    "S2": "Valentin-12-12-25",
-    "S3": "Timothee-17-12-25",
-    "S4": "Mona-22-12-25",
-    "S5": "Sarah-19-12-25",
+    "S2": "S2-12-12-25",
+    "S3": "S3-17-12-25",
+    "S4": "S4-22-12-25",
+    "S5": "S5-19-12-25",
 }
+_RAW_DIRS = os.path.join(os.path.dirname(os.path.abspath(__file__)), "raw_dirs.json")
+if os.path.exists(_RAW_DIRS):
+    SUBJECTS.update(json.load(open(_RAW_DIRS)))
 
 
 def bvh_path(S, sh):
@@ -320,12 +323,15 @@ def validate_s1(out_dir, log):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=OUT_DEFAULT)
+    ap.add_argument("--data-root", "--out", dest="out", metavar="DIR", default=os.environ.get("SKIM_ROOT"),
+                    help="SKIM dataset output root (default: $SKIM_ROOT)")
     ap.add_argument("--subjects", nargs="+", default=list(SUBJECTS))
     ap.add_argument("--validate", action="store_true", help="after S1, compare to existing residuals")
     ap.add_argument("--drop", type=float, default=0.20,
                     help="reject observed markers >this many metres from LBS (0.2 matches old pipeline)")
     args = ap.parse_args()
+    if not args.out:
+        ap.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
     os.makedirs(args.out, exist_ok=True)
     logf = open(f"{args.out}/run.log", "a")
 

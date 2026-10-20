@@ -5,7 +5,7 @@ pure-Python SKIM residual dataset (NPZ), instead of the old Blender JSON files.
 Background: the original 00_preprocess_data.py reads Blender-exported per-shot JSON
 (`*_residuals_*_world_lbs_scaled_tpose.json`, masks, LBS export). Those no longer exist for
 the re-triangulated shots (S3/009-012) or S4, and the whole residual set was regenerated in
-pure Python into /CT/SOMA/static00/SKIM_dataset/<S>/shot_*.npz. This adapter consumes that NPZ and
+pure Python into <SKIM root>/<S>/shot_*.npz. This adapter consumes that NPZ and
 writes the EXACT same training layout the model loader expects.
 
 Output (one dir per subject):
@@ -22,23 +22,22 @@ Conventions / alignment (all verified):
     column order/root frame differ). Output frame i uses BVH frame = NPZ frame_index[i] (the new
     pipeline's "output frame i <-> bvh frame i+1"), keeping pose and residual on the same bvh frame.
 
-Run:
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python preprocess_from_skim.py --subjects S1 S2 S3 S4 S5
+Run (SKIM root from --data-root, else $SKIM_ROOT; --out defaults to the same root):
+  python preprocess_from_skim.py --subjects S1 S2 S3 S4 S5
   ... --validate-only            # just check S1 pose reproduction vs existing, write nothing
 """
 import os, sys, glob, json, argparse
 import numpy as np
 from scipy.spatial.transform import Rotation
 
-sys.path.insert(0, "/CT/SOMA/work/Residuals-Python")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Residuals-Python"))
 from pymotion.io.bvh import BVH
 import pymotion.rotations.quat as quat
 import pymotion.rotations.ortho6d as sixd
 import batch_residuals as B
 from recreate_residuals import quat_wxyz_to_matrix, lbs_frame, rot_x, DEGREE_BVH_X
 
-SKIM = "/CT/SOMA/static00/SKIM_dataset"
-EXISTING = "/CT/SOMA/static00"          # for pose-reproduction validation only
+EXISTING = B.STATIC                     # for pose-reproduction validation only
 
 
 def pose6d_old_all(bvh):
@@ -90,8 +89,8 @@ def lbs_world_all(S, shot, model, bvh, frame_index, gR, gt):
     return out
 
 
-def process_subject(S, out_root, write=True, lbs=True, log=print):
-    npzs = sorted(glob.glob(f"{SKIM}/{S}/shot_*.npz"))
+def process_subject(S, skim_root, out_root, write=True, lbs=True, log=print):
+    npzs = sorted(glob.glob(f"{skim_root}/{S}/shot_*.npz"))
     if not npzs:
         log(f"  {S}: no SKIM npz found, skip"); return 0
     model = subject_model_for_lbs(S) if (write and lbs) else None
@@ -148,10 +147,14 @@ def validate_pose_S1():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--subjects", nargs="+", default=["S1", "S2", "S3", "S4", "S5"])
-    ap.add_argument("--out", default=SKIM)
+    ap.add_argument("--data-root", default=os.environ.get("SKIM_ROOT"), help="SKIM dataset root (default: $SKIM_ROOT)")
+    ap.add_argument("--out", default=None, help="output root (default: --data-root)")
     ap.add_argument("--no-lbs", action="store_true", help="write zeros for canonical_lbs (it is unused in training)")
     ap.add_argument("--validate-only", action="store_true")
     args = ap.parse_args()
+    if not args.data_root:
+        ap.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
+    args.out = args.out or args.data_root
     if args.validate_only:
         validate_pose_S1(); return
     if not validate_pose_S1():
@@ -159,7 +162,7 @@ def main():
     gt = 0
     for S in args.subjects:
         print(f"=== {S} ===")
-        gt += process_subject(S, args.out, write=True, lbs=not args.no_lbs)
+        gt += process_subject(S, args.data_root, args.out, write=True, lbs=not args.no_lbs)
     print(f"DONE: {gt} frames total -> {args.out}/<S>/preprocessed_vFinal_clean")
 
 

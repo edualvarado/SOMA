@@ -3,7 +3,7 @@ derive_relabel_lbs.py -- recover the proc_ID -> canonical_ID relabeling by match
 proc triangulation against the *LBS marker cloud* (canonical markers posed by the shot BVH),
 instead of the Blender-recovered observed cloud used by derive_relabel.py.
 
-Why: for S4 (Mona) the Blender reference was built from the OLD (bad) triangulation, so the
+Why: for S4 the Blender reference was built from the OLD (bad) triangulation, so the
 Blender-obs-based map systematically mapped proc IDs to neighbour markers (~11 cm residual).
 An oracle chamfer test on the NEW triangulation shows observed corners sit only ~2.5 cm from
 the nearest LBS marker -- i.e. the geometry is clean and only the LABELS are wrong. The LBS
@@ -19,9 +19,9 @@ Pipeline:
 Output: relabel_<S>.json  (same schema as derive_relabel.py; consumed by batch_residuals.py).
 
 Run:
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python derive_relabel_lbs.py S4
+  python derive_relabel_lbs.py S4
 """
-import sys, json, itertools
+import os, sys, json, itertools
 import numpy as np
 from collections import defaultdict, Counter
 from scipy.spatial import cKDTree
@@ -166,7 +166,7 @@ def derive(S):
     costs = np.array([m["cost_cm"] for m in mapping.values()])
     print(f"[{S}] mapped {len(mapping)}/{len(proc_seen)} proc IDs ({ident} identical); "
           f"cost median={np.median(costs):.2f}cm p90={np.percentile(costs,90):.2f}cm", flush=True)
-    out = f"/CT/SOMA/work/Residuals-Python/relabel_{S}.json"
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"relabel_{S}.json")
     json.dump({"map": mapping, "stats": stats}, open(out, "w"), indent=1)
     print(f"[{S}] wrote {out}", flush=True)
 

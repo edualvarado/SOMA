@@ -14,7 +14,7 @@ Pipeline (method A: direct marker-LBS, consistent with 05-Training):
 Default run = validation/comparison on a sample of frames (fast, no big files written).
 Use --full to evaluate every frame; --dump to also write the recreated residual JSON.
 
-    /CT/SOMA/static00/miniforge3/envs/soma/bin/python recreate_residuals.py
+    python recreate_residuals.py
 """
 import os
 import json
@@ -25,7 +25,7 @@ from pymotion.io.bvh import BVH
 # ----------------------------- config ------------------------------------
 SUBJECT = "S1"
 SHOT = "shot_001"
-BASE = f"/CT/SOMA/static00/{SUBJECT}"
+BASE = f"{os.environ.get('SOMA_STATIC', 'static00')}/{SUBJECT}"
 SHOT_DIR = f"{BASE}/raw/{SHOT}_captury"
 
 BVH_PATH = f"{SHOT_DIR}/{SUBJECT}_{SHOT}.bvh"

@@ -1,5 +1,8 @@
 import os
 import glob
+import argparse
+from forearm_detwist import detwist, rotmat_to_sixd
+from muscle_binding import bind_to_layer, transfer
 import json
 import time
 import numpy as np
@@ -33,13 +36,29 @@ def save_obj_fast(filepath, verts, faces):
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
     mesh.export(filepath)
 
+_PACKED_SHOTS = {}
+
+def load_packed_frame(processed_dir, frame_id):
+    """(pose, residuals, mask) of one frame from the packed <processed_dir>/<shot>.npz, or None if out of range.
+    frame_id is '<shot>_frame_<i>', as stored in <S>_validation_filepaths.json."""
+    shot, i = os.path.basename(frame_id).removesuffix(".npy").rsplit("_frame_", 1)
+    path = os.path.join(processed_dir, f"{shot}.npz")
+    if path not in _PACKED_SHOTS:
+        with np.load(path) as d:
+            _PACKED_SHOTS[path] = {k: d[k] for k in ("pose", "residuals", "masks")}
+            # residual = obs - (global_R @ LBS + global_t): undo the per-shot alignment, r <- global_R^T r
+            _PACKED_SHOTS[path]["global_R"] = d["global_R"].astype(np.float32) if "global_R" in d.files else np.eye(3, dtype=np.float32)
+    d, i = _PACKED_SHOTS[path], int(i)
+    if i >= len(d["pose"]):
+        return None
+    return d["pose"][i], d["residuals"][i].astype(np.float32) @ d["global_R"], d["masks"][i]
+
 # --- CONFIGURATION (Match your training config) ---
 # Centralized config to keep parameters organized
 CONFIG = {
     "subject": "S1",
-    # Paths (We will build absolute paths dynamically below)
-    "base_path_suffix": r"static00", 
-    "shot": "shot_004",
+    "shot": "shot_003", # held-out shots (whole-shot split): S1 shot_003/006/015, S2-S3 shot_006/012, S4-S5 shot_009/010
+    "architecture": "unet", # Options: "linear", "mlp", "unet" (must match ACTIVE_CHECKPOINT)
     # System
     "device": "cuda" if torch.cuda.is_available() else "cpu"
     }
@@ -49,71 +68,58 @@ CONFIG = {
 # Add new entries below. Change ACTIVE_CHECKPOINT to switch between them.
 
 CHECKPOINTS = {
-    # Stage 1: E_data + E_smooth only
-    "smoothness": {
-        "path": "./checkpoints/01_adding_smoothness/full_MLP_w_data_1_w_smooth_musc_1_w_smooth_skin_5_w_spring_musc_0_w_spring_skin_0_w_tangent_musc_0_w_tangent_skin_0_epoch_9.pth",
-        "result": "Deformation visible but spiky and noisy",
+    # Released model (SOMA_checkpoints.tar): UNet, SKIM V2, 40 epochs, seed 0. Needs the V2 dataset as root.
+    "release_v2_e40": {
+        "path": f"./checkpoints/{CONFIG['subject']}_ABLATION_UNET_RELEASE_V2_e40_best_data.pth",
+        "result": "see README.md, Released model",
+        "marker_offset": True,
+        "rig": "dataset",  # <root>/<S>/canonical_model/<S>_rig.npz (shipped with SKIM V2)
+        "rigid_correction": True,
+        "static_canon": f"./checkpoints/{CONFIG['subject']}_static_canon_RELEASE_V2_e40.npy",
+        "forearm_detwist": CONFIG["subject"] != "S1",  # raw-BVH input only; V2 packed poses are already de-twisted
     },
-    # Stage 2: + E_spring (stretch resistance)
-    "stretch": {
-        "path": "./checkpoints/02_adding_stretch/full_MLP_w_data_1_w_smooth_musc_005_w_smooth_skin_05_w_spring_musc_1_w_spring_skin_1_w_tangent_musc_0_w_tangent_skin_0_epoch_6.pth",
-        "result": "Best so far at this stage",
-    },
-    # Stage 3: + E_tangential
-    "tangential": {
-        "path": "./checkpoints/03_adding_tan/full_MLP_w_data_1_w_smooth_musc_0005_w_smooth_skin_005_w_spring_musc_1_w_spring_skin_1_w_tangent_musc_005_w_tangent_skin_001_epoch_9.pth",
-        "result": "Accordion artifact — needs fix",
-    },
-    # Stage 4: + E_biharmonic (equal_weight=True)
-    "biharmonic": {
-        "path": "./checkpoints/04_bi_new/full_MLP_w_data_1_w_smooth_musc_0005_w_smooth_skin_005_w_spring_musc_1_w_spring_skin_1_w_tangent_musc_005_w_tangent_skin_001_w_biharmonic_musc_1_w_biharmonic_skin_25_epoch_6.pth",
-        "result": "ep5: good (more wrinkles?), ep6: good, ep7: last good",
-    },
-    # Stage 5a: tuning tangential weights (tan_skin=1)
-    "tan_change_a": {
-        "path": "./checkpoints/05_changing_tan/full_MLP_w_data_1_w_smooth_musc_0005_w_smooth_skin_005_w_spring_musc_1_w_spring_skin_1_w_tangent_musc_1_w_tangent_skin_1_w_biharmonic_musc_1_w_biharmonic_skin_25_epoch_6.pth",
-        "result": "Good",
-    },
-    # Stage 5b: tuning tangential weights (tan_skin=0.1)
-    "tan_change_b": {
-        "path": "./checkpoints/05_changing_tan/full_MLP_w_data_1_w_smooth_musc_0005_w_smooth_skin_005_w_spring_musc_1_w_spring_skin_1_w_tangent_musc_1_w_tangent_skin_01_w_biharmonic_musc_1_w_biharmonic_skin_25_epoch_6.pth",
-        "result": "Good",
-    },
-    # Stage 5c: tuning smooth + tangential (vol=0) — used for visualization
-    "tan_change_c": {
-        "path": "./checkpoints/05_changing_tan/full_MLP_w_data_1_w_smooth_musc_001_w_smooth_skin_005_w_spring_musc_1_w_spring_skin_1_w_tangent_musc_1_w_tangent_skin_01_w_biharmonic_musc_1_w_biharmonic_skin_25_w_vol_musc_0_w_vol_skin_0_epoch_6.pth",
-        "result": "Works — used for visualization",
-    },
-    # Stage 6a: + E_vol on skin only (w_data=50)
-    "volume_skin_50": {
-        "path": "./checkpoints/06_adding_volume/full_MLP_w_data_50_w_smooth_musc_100_w_smooth_skin_200_w_spring_musc_1000_w_spring_skin_1000_w_tangent_musc_1_w_tangent_skin_01_w_biharmonic_musc_100_w_biharmonic_skin_200_w_vol_musc_0_w_vol_skin_10_epoch_5.pth",
-        "result": "Best with volume so far",
-    },
-    # Stage 6b: + E_vol on skin only (w_data=500)
-    "volume_skin_500": {
-        "path": "./checkpoints/06_adding_volume/full_MLP_w_data_500_w_smooth_musc_100_w_smooth_skin_200_w_spring_musc_1000_w_spring_skin_1000_w_tangent_musc_1_w_tangent_skin_01_w_biharmonic_musc_100_w_biharmonic_skin_200_w_vol_musc_0_w_vol_skin_10_epoch_6.pth",
-        "result": "Best with volume (w_data=500)",
-    },
-    # Stage 7: + E_vol on both muscle and skin
-    "volume_both": {
-        "path": "./checkpoints/07_adding_volume_both/full_MLP_w_data_50_w_smooth_musc_100_w_smooth_skin_200_w_spring_musc_1000_w_spring_skin_1000_w_tangent_musc_1_w_tangent_skin_01_w_biharmonic_musc_100_w_biharmonic_skin_200_w_vol_musc_10_w_vol_skin_10_epoch_5.pth",
-        "result": "Final",
-    },
-    # Stage 8: + E_vol on both, with mask
-    "volume_both_mask": {
-        "path": "./checkpoints/08_adding_volume_both_clean/full_MLP_w_data_50_w_smooth_musc_100_w_smooth_skin_200_w_spring_musc_1000_w_spring_skin_1000_w_tangent_musc_1_w_tangent_skin_01_w_biharmonic_musc_100_w_biharmonic_skin_200_w_vol_musc_10_w_vol_skin_10_epoch_5.pth",
-        "result": "Final (with mask)",
-    }
 }
 
 # ------------------------------------------------------------------
-ACTIVE_CHECKPOINT = "volume_both_mask"  # <-- Change this to switch checkpoints
+ACTIVE_CHECKPOINT = "release_v2_e40"  # <-- Change this to switch checkpoints
 CHECKPOINT_PATH = CHECKPOINTS[ACTIVE_CHECKPOINT]["path"]
+RIG_PATH = CHECKPOINTS[ACTIVE_CHECKPOINT].get("rig")  # rebuilt rig (build_rig.py), if the checkpoint uses one
+FOREARM_DETWIST = CHECKPOINTS[ACTIVE_CHECKPOINT].get("forearm_detwist", False)  # trained with 01 --forearm-detwist
+# ------------------------------------------------------------------
+
+# Hips rest offset (m, BVH frame). The raw Captury BVHs of S2-S5 have Hips OFFSET 0 0 0, which puts the
+# rest skeleton ~0.85 m below the mesh. Estimated from the layer meshes (calibrated on S1's re-exported BVH).
+HIPS_REST_OFFSET = {
+    "S2": (-0.002, 0.876, -0.075),
+    "S3": (0.0, 0.889, -0.129),
+    "S4": (0.0, 0.849, -0.083),
+    "S5": (0.007, 0.839, -0.065),
+}
+
+# Inner-layer rest offset (m, mesh frame). S4's skin layer sits at a constant offset from all of its inner meshes (muscle
+# and bone layers, muscle meshes, skel_mesh): the head vertices, which the skin and muscle layers share in the other
+# subjects, differ by exactly this (sd < 1e-6). The skin carries the markers, so the inner meshes are moved onto it.
+LAYER_REST_OFFSET = {
+    "S4": (0.002098, 0.014745, 0.010864),
+}
 # ------------------------------------------------------------------
 
 # --- PATH SETUP ---
-# Adjust this to match your cluster structure
-BASE_DIR = rf"/CT/SOMA/{CONFIG['base_path_suffix']}/{CONFIG['subject']}"
+# All inputs come from the SKIM dataset root: --data-root, else the SKIM_ROOT env var.
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--data-root", default=os.environ.get("SKIM_ROOT"),
+                     help="SKIM dataset root (default: $SKIM_ROOT)")
+DATA_ROOT = _parser.parse_args().data_root
+if not DATA_ROOT:
+    _parser.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
+# SKIM V2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
+_meta = os.path.join(DATA_ROOT, "metadata.json")
+SKIM_VERSION = json.load(open(_meta)).get("dataset_version", 1) if os.path.exists(_meta) else 1
+if SKIM_VERSION >= 2:
+    LAYER_REST_OFFSET.clear()
+if RIG_PATH == "dataset":
+    RIG_PATH = os.path.join(DATA_ROOT, CONFIG['subject'], "canonical_model", f"{CONFIG['subject']}_rig.npz")
+BASE_DIR = os.path.join(DATA_ROOT, CONFIG['subject'])
 
 PATHS = {
     "raw": os.path.join(BASE_DIR, "raw"),
@@ -431,6 +437,44 @@ def get_rest_joint_locations_zero_offset(bvh_obj, scale=1.0):
 
     return j_rest, parents, offsets
 
+def load_shot_motion(bvh_path, scale):
+    """Per-shot motion for the viewer: raw BVH (Global) and the processed 6D version (root centred + root fix).
+    Returns (local_rotations_global, global_positions_global, reconstructed_6d_local_rotations,
+    global_positions_6d, local_positions_6d, continuous). Rest skeletons are taken once in main()."""
+    # A1. Global
+    bvh_global = BVH()
+    bvh_global.load(bvh_path)
+    local_rotations_global, local_positions_global, _, _, _, _ = bvh_global.get_data()
+    global_positions_global = local_positions_global[:, 0, :]  # view: scaled together with the root below
+    local_positions_global[:, 0, :] *= scale
+
+    # A2. 6D
+    bvh_6d = BVH()
+    bvh_6d.load(bvh_path)
+    local_rotations_6d, local_positions_6d, _, _, _, _ = bvh_6d.get_data()
+    global_positions_6d = local_positions_6d[:, 0, :]  # view: zeroed together with the root below
+
+    # 1. Root position in the world origin (keep the original root orientation)
+    local_positions_6d[:, 0, :] = 0.0
+
+    # 2. Root rotation fix: R_z(90) @ R_y(90) @ R_root
+    z_rot = np.pi / 2
+    angles_6d = np.array([0, z_rot, z_rot])[..., np.newaxis]
+    axes_6d = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]])
+    rotmats_6d = quat.to_matrix(quat.from_angle_axis(angles_6d, axes_6d))
+    R_total_6d = rotmats_6d[2] @ rotmats_6d[1] @ rotmats_6d[0]
+    q_root_6d = local_rotations_6d[:, 0, :]
+    q_root_xyzw_6d = np.concatenate([q_root_6d[:, 1:], q_root_6d[:, 0:1]], axis=1)
+    R_new_quat_xyzw_6d = Rotation.from_matrix(R_total_6d @ Rotation.from_quat(q_root_xyzw_6d).as_matrix()).as_quat()
+    local_rotations_6d[:, 0, :] = np.concatenate([R_new_quat_xyzw_6d[:, 3:4], R_new_quat_xyzw_6d[:, :3]], axis=1)  # [w, x, y, z]
+
+    # 3. 6D continuous representation (and back, for the skeleton display)
+    continuous = sixd.from_quat(local_rotations_6d)
+    reconstructed_6d_local_rotations = sixd.to_quat(continuous)
+
+    local_positions_6d[:, 0, :] *= scale
+    return local_rotations_global, global_positions_global, reconstructed_6d_local_rotations, global_positions_6d, local_positions_6d, continuous
+
 def sixd_to_rotmat(sixd_reps):
     x_raw = sixd_reps[..., 0:3]
     y_raw = sixd_reps[..., 3:6]
@@ -440,7 +484,8 @@ def sixd_to_rotmat(sixd_reps):
     y = torch.cross(z, x, dim=-1)
     return torch.stack((x, y, z), dim=-1)
 
-def lbs_working_batch_rotmat(vertices, rot_mats, weights, j_rest, parents, root_position):
+def lbs_working_batch_rotmat(vertices, rot_mats, weights, j_rest, parents, root_position, corr=None):
+    """corr: optional (B,J,4,4) rigid correction per joint (01 --rigid-correction), right-multiplied onto its local transform."""
     batch_size = vertices.shape[0]
     num_joints = j_rest.shape[0]
     device = vertices.device
@@ -462,18 +507,19 @@ def lbs_working_batch_rotmat(vertices, rot_mats, weights, j_rest, parents, root_
         G_rest[:, i] = T
     G_rest_inv = torch.inverse(G_rest)
 
-    G_posed = torch.zeros_like(G_rest)
+    G_posed = []  # list, not in-place writes: the rigid correction needs gradients through the chain
     for i in range(num_joints):
         T_local = ident4.clone()
         T_local[:, :3, :3] = rot_mats[:, i]
         if parents[i] == -1:
             T_local[:, :3, 3] = root_position
-            G_posed[:, i] = T_local
         else:
             T_local[:, :3, 3] = (j_rest[i] - j_rest[parents[i]]).unsqueeze(0)
-            G_posed[:, i] = G_posed[:, parents[i]] @ T_local
+        if corr is not None:
+            T_local = T_local @ corr[:, i]
+        G_posed.append(T_local if parents[i] == -1 else G_posed[parents[i]] @ T_local)
 
-    skinning = G_posed @ G_rest_inv
+    skinning = torch.stack(G_posed, dim=1) @ G_rest_inv
     homo = torch.cat([vertices, torch.ones(batch_size, vertices.shape[1], 1, device=device, dtype=vertices.dtype)], dim=-1)
     blended = torch.einsum('vj,bjmn->bvmn', weights, skinning)
     out = blended @ homo.unsqueeze(-1)
@@ -920,6 +966,43 @@ class MuscleUNetModel(nn.Module):
 
 # Full End-to-End Model
 # This model integrates the muscle blendshape model, deformation transfer, and LBS.   
+# Rigid skeleton correction (copy of 01 --rigid-correction)
+RIGID_FREE_JOINTS = ("Neck", "Head", "LeftHand", "RightHand", "LeftFoot", "RightFoot", "LeftToeBase", "RightToeBase")
+
+def axis_angle_to_rotmat(aa):
+    """Rodrigues, (...,3) -> (...,3,3); smooth at zero."""
+    theta2 = aa.pow(2).sum(-1, keepdim=True).unsqueeze(-1)
+    theta = (theta2 + 1e-12).sqrt()
+    x, y, z = aa.unbind(-1)
+    zero = torch.zeros_like(x)
+    A = torch.stack([zero, -z, y, z, zero, -x, -y, x, zero], -1).view(*aa.shape[:-1], 3, 3)
+    eye = torch.eye(3, device=aa.device, dtype=aa.dtype).expand_as(A)
+    return eye + torch.sin(theta) / theta * A + (1 - torch.cos(theta)) / (theta2 + 1e-12) * (A @ A)
+
+class RigidCorrectionHead(nn.Module):
+    """Pose-conditioned rigid correction per joint, applied inside LBS (see 01). Output (B,J,4,4) + raw output."""
+    def __init__(self, num_joints, joint_mask, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(num_joints * 9, hidden_dim), nn.LeakyReLU(0.2),
+                                 nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(0.2),
+                                 nn.Linear(hidden_dim, num_joints * 6))
+        self.register_buffer('joint_mask', joint_mask)  # (J,6): 0 = component fixed
+
+    def forward(self, rot_mats):
+        B, J = rot_mats.shape[:2]
+        eye = torch.eye(3, device=rot_mats.device, dtype=rot_mats.dtype)
+        raw = self.net((rot_mats - eye).reshape(B, -1)).view(B, J, 6) * self.joint_mask
+        C = torch.eye(4, device=rot_mats.device, dtype=rot_mats.dtype).repeat(B, J, 1, 1)
+        C[..., :3, :3] = axis_angle_to_rotmat(0.1 * raw[..., :3])
+        C[..., :3, 3] = 0.02 * raw[..., 3:]
+        return C, raw
+
+def load_rigid_head(model, joint_names, checkpoint_path, device):
+    """Attach the rigid head saved by 01 next to the checkpoint (<ckpt>_rigid.pth)."""
+    model.rigid_head = RigidCorrectionHead(len(joint_names), torch.zeros(len(joint_names), 6)).to(device)
+    model.rigid_head.load_state_dict(torch.load(checkpoint_path.replace('.pth', '_rigid.pth'), map_location=device))
+    model.rigid_head.eval()
+
 class SOMAModel(nn.Module):
     """
     Full End-to-End SOMA Model: Integrates deformation model (muscle/skin blendshapes),
@@ -949,7 +1032,8 @@ class SOMAModel(nn.Module):
                  # ---- OPTIONAL ----
                  active_muscle_mask=None,
                  target_marker_mask=None,
-                 stability_mask=None):
+                 stability_mask=None,
+                 architecture="mlp"):
         """
         Args:
             ---- MESH GEOMETRY ----
@@ -1040,7 +1124,11 @@ class SOMAModel(nn.Module):
         self.register_buffer('p_bind', p_bind)
         self.register_buffer('bary_verts', bary_verts)
         self.register_buffer('bary_weights', bary_weights)
-        
+        # Constant per-marker offset added to the predicted markers (0 unless calibrate_marker_offset is called)
+        self.register_buffer('marker_offset', torch.zeros_like(p_bind))
+        self.rigid_head = None  # rigid skeleton correction (01 --rigid-correction), attached by load_rigid_head
+        self.shared_bone_weights = False  # rebuilt rig: bone layer skinned with the skin weights instead of one-hot
+
         # ========================================================================================
         # 6. OPTIONAL MASKS
         # ========================================================================================
@@ -1062,27 +1150,39 @@ class SOMAModel(nn.Module):
         # ========================================================================================
         # 7. LEARNABLE DEFORMATION MODELS
         # ========================================================================================
-        # Instantiate the Linear Blendshape Model
+        # Instantiate the deformation model (must match the architecture the checkpoint was trained with)
         # This learns muscle and skin deformation as D = P @ (R - I)
-        
-        # self.deformation_model = MuscleBlendshapeModel(
-        #     num_vertices=self.m_bind.shape[0],
-        #     num_joints=self.j_rest.shape[0]
-        # )
 
-        self.deformation_model = MuscleMLPModel(
-            num_vertices=self.m_bind.shape[0],
-            num_joints=self.j_rest.shape[0]
-        )
+        if architecture == "linear":
+            logger.info("[MODEL] Using LINEAR BLENDSHAPES architecture")
+            self.deformation_model = MuscleBlendshapeModel(
+                num_vertices=self.m_bind.shape[0], num_joints=self.j_rest.shape[0]
+            )
+        elif architecture == "mlp":
+            logger.info("[MODEL] Using MLP architecture")
+            self.deformation_model = MuscleMLPModel(
+                num_vertices=self.m_bind.shape[0], num_joints=self.j_rest.shape[0]
+            )
+        elif architecture == "unet":
+            logger.info("[MODEL] Using U-NET architecture")
+            self.deformation_model = MuscleUNetModel(
+                num_vertices=self.m_bind.shape[0], num_joints=self.j_rest.shape[0]
+            )
+        else:
+            raise ValueError(f"Unknown architecture: {architecture}")
 
-        # self.deformation_model = MuscleUNetModel(
-        #     num_vertices=self.m_bind.shape[0],
-        #     num_joints=self.j_rest.shape[0]
-        # )
-        
         logger.debug(f"[MODEL] SOMAModel initialized with {self.m_bind.shape[0]} vertices and {self.j_rest.shape[0]} joints")
         logger.debug(f"[MODEL] Markers: {self.p_bind.shape[0]}, LBS Joints: {self.skin_weights.shape[1]}")
-    
+
+    def calibrate_marker_offset(self, rot_identity):
+        """Set marker_offset so that zero displacement reproduces p_bind exactly (for checkpoints trained with --marker-offset)."""
+        with torch.no_grad():
+            zero_root = torch.zeros(1, 3, device=self.s_bind.device, dtype=self.s_bind.dtype)
+            s_tpose = lbs_working_batch_rotmat(self.s_bind.unsqueeze(0), rot_identity, self.skin_weights, self.j_rest, self.parents, zero_root)
+            p_skin = barycentric_interpolation_batch(s_tpose, self.bary_verts, self.bary_weights)[0] + self.j_rest[0]
+            self.marker_offset = self.p_bind - p_skin
+        return self.marker_offset.norm(dim=-1)
+
     def forward(self, rot_input, rot_identity_input, root_positions=None):
         # Normalize to rotation matrices
         if rot_input.dim() == 4 and rot_input.shape[-2:] == (3, 3):
@@ -1152,12 +1252,17 @@ class SOMAModel(nn.Module):
         s_final = self.s_bind.unsqueeze(0) + d_skin
 
         # 8. LBS on skin (optimized) and muscle (optimized)
-        m_final_theta = lbs_working_batch_rotmat(m_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions)
-        s_final_theta = lbs_working_batch_rotmat(s_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions)
+        corr = self.rigid_head(rot_mats)[0] if self.rigid_head is not None else None
+        m_final_theta = lbs_working_batch_rotmat(m_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions, corr)
+        s_final_theta = lbs_working_batch_rotmat(s_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions, corr)
 
         # (Assuming self.b_bind and self.bone_weights exist)
         b_bind_batch = self.b_bind.unsqueeze(0).expand(batch_size, -1, -1)
-        b_final_theta = lbs_working_batch_rotmat(b_bind_batch, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions)
+        # Bones are rigid: one-hot on the dominant joint, as in 03 and 01 --rigid-bone
+        bone_weights = torch.zeros_like(self.skin_weights).scatter_(1, self.skin_weights.argmax(dim=1, keepdim=True), 1.0)
+        if self.shared_bone_weights:  # rebuilt rig: the bone layer shares the smooth bone-heat weights
+            bone_weights = self.skin_weights
+        b_final_theta = lbs_working_batch_rotmat(b_bind_batch, rot_mats, bone_weights, self.j_rest, self.parents, root_positions, corr)
 
         # 9. Barycentric interpolation to get predicted marker positions
         p_pred_theta = barycentric_interpolation_batch(s_final_theta, self.bary_verts, self.bary_weights)
@@ -1180,7 +1285,7 @@ class SOMAModel(nn.Module):
         zero_root = torch.zeros_like(root_positions)
         s_final_tpose = lbs_working_batch_rotmat(s_final, rot_identity_input, self.skin_weights, self.j_rest, self.parents, zero_root)
 
-        p_pred_tpose = barycentric_interpolation_batch(s_final_tpose, self.bary_verts, self.bary_weights)
+        p_pred_tpose = barycentric_interpolation_batch(s_final_tpose, self.bary_verts, self.bary_weights) + self.marker_offset
 
         return {
             # ---- DEFORMATIONS IN CANONICAL SPACE (T-POSE) ----
@@ -1240,13 +1345,7 @@ def main():
 
     logger.info("[BVH] FINDING SAMPLE BVH...")
 
-    bvh_path = glob.glob(os.path.join(PATHS['raw'], f"{SHOT}_captury", f"{SUBJECT}_{SHOT}.bvh"))[0]
-
-    # EXPERIMENTAL
-    # ------------
-    # bvh_path = os.path.join(BASE_DIR, "validation", "S2_shot_002.bvh")
-    bvh_path = os.path.join(BASE_DIR, "0252.bvh")
-    # ------------
+    bvh_path = os.path.join(PATHS['raw'], f"{SHOT}_captury", f"{SUBJECT}_{SHOT}.bvh")
 
     if not os.path.exists(bvh_path):
         raise FileNotFoundError(f"Sample BVH file not found at {bvh_path}")
@@ -1266,14 +1365,6 @@ def main():
     skin_mesh_path = os.path.join(PATHS['layers_tpose'], f"skin_layer-{SUBJECT}-TPose.obj")
     bone_mesh_path = os.path.join(PATHS['layers_tpose'], f"skel_layer-{SUBJECT}-TPose.obj")
 
-    # EXPERIMENTAL
-    # ------------
-    # NEW_SUBJECT = "S5"
-    # NEW_BASE_DIR = rf"/CT/SOMA/{CONFIG['base_path_suffix']}"
-    # muscle_mesh_path = os.path.join(NEW_BASE_DIR, f"{NEW_SUBJECT}", "layers", "tpose", f"musc_layer-{NEW_SUBJECT}-TPose.obj")
-    # skin_mesh_path = os.path.join(NEW_BASE_DIR, f"{NEW_SUBJECT}", "layers", "tpose", f"skin_layer-{NEW_SUBJECT}-TPose.obj")
-    # bone_mesh_path = os.path.join(NEW_BASE_DIR, f"{NEW_SUBJECT}", "layers", "tpose", f"skel_layer-{NEW_SUBJECT}-TPose.obj")
-    # ------------
 
     if not os.path.exists(muscle_mesh_path):
         raise FileNotFoundError(f"Muscle Layer file not found at {muscle_mesh_path}")
@@ -1304,6 +1395,7 @@ def main():
     # Loading Individual Muscles Meshes
     try:
         single_m_vertex_np, single_m_face_np, single_l_muscle_sp, single_m_vertex_ranges, single_m_face_ranges = load_and_stack_muscles(muscle_obj_dir)
+        single_m_vertex_np = single_m_vertex_np + np.asarray(LAYER_REST_OFFSET.get(SUBJECT, (0.0, 0.0, 0.0)), dtype=single_m_vertex_np.dtype)
 
         # Create Tensors
         single_m_bind_vertices = torch.from_numpy(single_m_vertex_np).float()
@@ -1356,18 +1448,12 @@ def main():
 
     logger.info("[RESIDUALS] FINDING RESIDUALS AND MASKS DATA...")
 
-    local_residuals_path = os.path.join(PATHS['raw'], f"{SHOT}_captury", f"{SUBJECT}_residuals_{SHOT}_world_lbs_scaled_tpose.json")
-    mask_path = os.path.join(PATHS['raw'], f"{SHOT}_captury", f"{SUBJECT}_masked_residuals_{SHOT}_world_tpose.json")
+    packed_shot_path = os.path.join(PATHS['processed'], f"{SHOT}.npz")
 
-    if not os.path.exists(local_residuals_path):
-        raise FileNotFoundError(f"Local Residuals file not found at {local_residuals_path}")
+    if not os.path.exists(packed_shot_path):
+        raise FileNotFoundError(f"Packed residuals/masks file not found at {packed_shot_path}")
     else:
-        logger.debug(f"[RESIDUALS] Local residuals path: {local_residuals_path}")
-
-    if not os.path.exists(mask_path):
-        raise FileNotFoundError(f"Mask file not found at {mask_path}")
-    else:
-        logger.debug(f"[MASK] Mask path: {mask_path}")
+        logger.debug(f"[RESIDUALS] Packed residuals/masks path: {packed_shot_path}")
         logger.info("============================================")
 
     # ----------------
@@ -1402,35 +1488,10 @@ def main():
 
     # ----------------
 
-    # ----------------
-    # H. Muscle Vertex Mapping
-
-    logger.info("[MUSCLE VERTEX MAPPING] FINDING MUSCLE VERTEX MAPPING DATA...")
-
-    # Path to the binding JSON
-    muscle_vertex_mapping_path = os.path.join(PATHS['canonical'], "individual_muscle_to_skin_binding.json")
-
-    if not os.path.exists(muscle_vertex_mapping_path):
-        raise FileNotFoundError(f"Muscle Vertex Mapping file not found at {muscle_vertex_mapping_path}")
-    else:
-        logger.debug(f"[MUSCLE VERTEX MAPPING] Muscle vertex mapping path: {muscle_vertex_mapping_path}")
-        logger.info("============================================")
-
-    # ----------------
-
     # ---------------------------------------
     # [OPTIMIZATION] PRE-LOAD STATIC GEOMETRY
     # ---------------------------------------
-    logger.info("[OPTIMIZATION] Pre-loading static muscle and skin meshes for fast processing...")
-    
-    # 1. Pre-load Raw Skin (Rest Pose)
-    # We need this to calculate the delta (Deformed - Rest)
-    try:
-        skin_verts_raw, skin_faces_raw = load_obj_simple(skin_mesh_path)
-        logger.success(f"[PRE-LOAD] Loaded Raw Skin: {len(skin_verts_raw)} verts")
-    except Exception as e:
-        logger.error(f"[PRE-LOAD] Failed to load skin: {e}")
-        skin_verts_raw, skin_faces_raw = None, None
+    logger.info("[OPTIMIZATION] Pre-loading static muscle meshes for fast processing...")
 
     # 2. Pre-load All Muscles
     # Dictionary: { "muscle_name": {'verts': np.array, 'faces': np.array} }
@@ -1441,6 +1502,7 @@ def main():
             m_name = os.path.basename(fpath).split('.')[0]
             try:
                 v, f = load_obj_simple(fpath)
+                v = v + np.asarray(LAYER_REST_OFFSET.get(SUBJECT, (0.0, 0.0, 0.0)), dtype=v.dtype)
                 preloaded_muscles[m_name] = {'verts': v, 'faces': f}
             except Exception as e:
                 logger.warning(f"Failed to load muscle {m_name}: {e}")
@@ -1494,29 +1556,23 @@ def main():
 
     # Get the rest joint locations and convert to torch tensors
     j_rest_global, parents_global, offsets_global = get_rest_joint_locations(bvh_global, scale=SCALE) # Scale is always 1.0 / offset is NOT set to zero in the hips
+    if SUBJECT in HIPS_REST_OFFSET:
+        hips_offset = np.array(HIPS_REST_OFFSET[SUBJECT], dtype=j_rest_global.dtype)
+        j_rest_global = j_rest_global + hips_offset
+        offsets_global[0] = hips_offset
+        logger.warning(f"[BVH] Injected Hips rest offset {hips_offset} for {SUBJECT}")
+    if RIG_PATH:  # rebuilt rig (build_rig.py): rest joints refitted to the bones
+        _rig = np.load(RIG_PATH)
+        if [str(n) for n in _rig["joint_names"]] != list(joint_names_global):
+            raise ValueError(f"Rig {RIG_PATH} joint order does not match the BVH")
+        j_rest_global = _rig["j_rest"].astype(j_rest_global.dtype)
+        offsets_global = np.stack([j_rest_global[i] - (j_rest_global[p] if p >= 0 else 0) for i, p in enumerate(parents_global)])
+        logger.warning(f"[RIG] Rest joints from {RIG_PATH} (max move {np.abs(_rig['j_rest'] - _rig['j_rest_captury']).max() * 100:.1f} cm)")
     j_rest_tensor_global = torch.from_numpy(j_rest_global).float() # (24, 3)    <------------------------------------ TENSOR
     parents_tensor_global = torch.from_numpy(parents_global).long() # (24,)     <------------------------------------ TENSOR
     offsets_tensor_global = torch.from_numpy(offsets_global).float() # (24, 3)  <------------------------------------ TENSOR
 
     # ---
-
-    # Extract motion data
-    local_rotations_global, local_positions_global, _, _, _, _ = bvh_global.get_data()
-
-    # Separate global position of the root joint for visualization
-    global_positions_global = local_positions_global[:, 0, :]
-
-    # Scale the skeleton
-    local_positions_global[:, 0, :] *= SCALE # Same way we scale the offsets for the rest pose, we need to scale the root position
-
-    num_frames = local_rotations_global.shape[0]
-
-    # Print first 5 joints of rotations and positions for the first frame
-    logger.debug(f"[BVH] First frame local rotations (Global): {local_rotations_global[0, :5]}")
-    logger.debug(f"[BVH] First frame local positions (Global): {local_positions_global[0, :5]}")
-
-    logger.success(f"[BVH] Loaded BVH (Global) with {num_frames} frames.")
-    logger.info("============================================")
 
     # ----------------
     # A2. 6D Representation
@@ -1548,73 +1604,13 @@ def main():
     parents_tensor_6d = torch.from_numpy(parents_6d).long() # (24,)     <------------------------------------ TENSOR
     offsets_tensor_6d = torch.from_numpy(offsets_6d).float() # (24, 3)  <------------------------------------ TENSOR
 
-    # Extract motion data
-    local_rotations_6d, local_positions_6d, _, offset_6d_new, _, _ = bvh_6d.get_data()
-    
-    # Separate global position of the root joint for visualization
-    global_positions_6d = local_positions_6d[:, 0, :]
+    # Per-shot motion (re-loaded by the Shot dropdown in the viewer)
+    local_rotations_global, global_positions_global, reconstructed_6d_local_rotations, global_positions_6d, local_positions_6d, continuous = load_shot_motion(bvh_path, SCALE)
+    num_frames = continuous.shape[0]
+    local_rotations_6d_rest = local_rotations_global.copy()  # raw rotations with the root zeroed (rest hips axes)
+    local_rotations_6d_rest[:, 0, :] = 0.0
 
-    # ===== PROCESS MOTION DATA ===== 
-
-    # 1. SET ROOT POSITION IN THE WORLD ORIGIN (0,0,0) (zero translation only; keep original root orientation)
-    local_positions_6d[:, 0, :] = np.zeros((local_positions_6d.shape[0], 3)) # root joint position <-- We center the root (which now is the hips, like it should be) in the global origin (0,0,0)
-
-    # 2. SET ROTATION
-
-    # 2.1 Do NOT zero the root rotation; preserve original orientation
-    local_rotations_6d_rest = local_rotations_6d.copy()
-    local_rotations_6d_rest[:, 0, :] = np.zeros((local_rotations_6d.shape[0], 4))
-
-    # 2.2 Fix Rotation
-    # Define rotation in axis angle and convert to quaternion, then to rotation matrix
-
-    z_rot = np.pi / 2
-    angles_6d = np.array([0, z_rot, z_rot])[..., np.newaxis] # angles.shape = [3, 1]
-
-    axes_6d = np.array([[1, 0, 0], [0, 1, 0], [0, 0, 1]]) # axis.shape = [3, 3]
-    q_6d = quat.from_angle_axis(angles_6d, axes_6d)
-    rotmats_6d = quat.to_matrix(q_6d)
-
-    # Extract current root orientation and convert to [x, y, z, w] for scipy
-    q_root_6d = local_rotations_6d[:, 0, :]
-    q_root_xyzw_6d = np.concatenate([q_root_6d[:, 1:], q_root_6d[:, 0:1]], axis=1)  # (num_frames, 4)
-    
-    # Convert to rotation matrices
-    rotmats_root_6d = Rotation.from_quat(q_root_xyzw_6d).as_matrix()  # (num_frames, 3, 3)
-
-    # Compose rotations
-    R_x_6d = rotmats_6d[0]  # (3, 3)
-    R_y_6d = rotmats_6d[1]  # (3, 3)
-    R_z_6d = rotmats_6d[2]  # (3, 3)
-    R_total_6d = R_z_6d @ R_y_6d @ R_x_6d  # (3, 3)
-
-    # Apply rotations
-    R_new_6d = R_total_6d @ rotmats_root_6d  # (num_frames, 3, 3)
-
-    # Convert back to quaternion [x, y, z, w]
-    R_new_quat_xyzw_6d = Rotation.from_matrix(R_new_6d).as_quat()  # (num_frames, 4)
-
-    # Convert back to [w, x, y, z]
-    R_new_quat_wxyz_6d = np.concatenate([R_new_quat_xyzw_6d[:, 3:4], R_new_quat_xyzw_6d[:, :3]], axis=1)
-    local_rotations_6d[:, 0, :] = R_new_quat_wxyz_6d
-
-    # 3. CONVERT TO 6D CONTINUOUS REPRESENTATION AND BACK TO VERIFY
-    continuous = sixd.from_quat(local_rotations_6d)
-    logger.debug("[BVH] 6D continuous representation shape:", continuous.shape) # (2348, 24, 3, 2)
-    reconstructed_6d_local_rotations = sixd.to_quat(continuous)
-    logger.debug("[BVH] 6D reconstructed rotations shape:", reconstructed_6d_local_rotations.shape) # (2348, 24, 4)
-
-    # 4. UPDATE BVH DATA WITH PROCESSED MOTION
-    bvh_6d.set_data(local_rotations_6d, local_positions_6d)
-
-    # ==============================
-
-    # Scale the skeleton
-    local_positions_6d[:, 0, :] *= SCALE # Same way we scale the offsets for the rest pose, we need to scale the root position
-
-    num_frames = reconstructed_6d_local_rotations.shape[0]
-
-    logger.success(f"[BVH] Loaded BVH (6D) with {num_frames} frames.")
+    logger.success(f"[BVH] Loaded BVH (Global + 6D) with {num_frames} frames.")
     logger.info("============================================")
 
     # ----------------
@@ -1627,6 +1623,7 @@ def main():
     try:
         logger.info("[MESH] Loading muscle layer...")
         musc_layer_vertices_np, musc_layer_faces_np = load_obj_simple(muscle_mesh_path)
+        musc_layer_vertices_np = musc_layer_vertices_np + np.asarray(LAYER_REST_OFFSET.get(SUBJECT, (0.0, 0.0, 0.0)), dtype=musc_layer_vertices_np.dtype)
         musc_layer = trimesh.Trimesh(vertices=musc_layer_vertices_np, faces=musc_layer_faces_np, process=False)
 
         if not isinstance(musc_layer, trimesh.Trimesh):
@@ -1645,6 +1642,7 @@ def main():
 
         logger.info("[MESH] Loading bone layer...")
         bone_layer_vertices_np, bone_layer_faces_np = load_obj_simple(bone_mesh_path)
+        bone_layer_vertices_np = bone_layer_vertices_np + np.asarray(LAYER_REST_OFFSET.get(SUBJECT, (0.0, 0.0, 0.0)), dtype=bone_layer_vertices_np.dtype)
         bone_layer = trimesh.Trimesh(vertices=bone_layer_vertices_np, faces=bone_layer_faces_np, process=False)
 
         if not isinstance(bone_layer, trimesh.Trimesh):
@@ -1790,6 +1788,9 @@ def main():
     logger.info(f"[LBS] Loaded skin mesh with {s_bind_num_vertices} vertices and {len(skin_layer.faces)} faces.")
 
     weights_data = np.load(skin_weights_npy_path) # Instead of generating it, we just load it now
+    if RIG_PATH:
+        weights_data = _rig["weights"].astype(np.float32)
+        logger.warning(f"[RIG] Skin weights from {RIG_PATH} (bone heat)")
     skin_weights_tensor = torch.from_numpy(weights_data).float() # <------------------------------------ TENSOR
  
     logger.debug(f"[LBS] Loaded skin_weights matrix with shape: {skin_weights_tensor.shape}")  # (23752, 24)
@@ -1839,70 +1840,12 @@ def main():
     inv_bind_matrices = get_inverse_bind_matrices(j_rest_tensor_global)
 
     # ----------------
-    # H. Muscle Vertex Mapping -> [[DONE]]
+    # H. Individual muscles -> muscle layer binding (muscle_binding.py; replaces the dataset's
+    #    individual_muscle_to_skin_binding.json, whose triangle indices do not match the released meshes)
 
-    muscle_bary_map = None
-    muscle_name_mapping = {}  # Map new filenames to old JSON keys
-
-    if os.path.exists(muscle_vertex_mapping_path):
-        with open(muscle_vertex_mapping_path, 'r') as f:
-            muscle_bary_map = json.load(f)
-        logger.debug(f"[MUSCLE VERTEX MAPPING] Loaded Muscle-Skin Map from {os.path.basename(muscle_vertex_mapping_path)}")
-
-        # Create mapping from actual filenames to JSON keys
-        all_muscle_files = sorted(glob.glob(os.path.join(muscle_obj_dir, "*.obj")))
-        json_keys = list(muscle_bary_map.keys()) # Get all keys from the JSON map
-        
-        if len(all_muscle_files) > 0:
-            for actual_file in all_muscle_files:
-                actual_name = os.path.basename(actual_file).replace(".obj", "") # e.g., "Abs_t-pose"
-                json_key_to_use = None # Initialize to None for each muscle
-
-                # --- Mapping Strategy ---
-                # 1. Attempt: Exact match (e.g., "Abs_t-pose" == "Abs_t-pose")
-                if actual_name in muscle_bary_map:
-                    json_key_to_use = actual_name
-                
-                # 2. Attempt: Specific transformation for common patterns
-                #    e.g., "Abs_t-pose" (from OBJ) -> "Abs_a-pose-ID" (for JSON)
-                if json_key_to_use is None and "_t-pose" in actual_name:
-                    base_muscle_name = actual_name.replace("_t-pose", "") # Extracts "Abs"
-                    candidate_json_key = f"{base_muscle_name}_a-pose-ID" # Constructs "Abs_a-pose-ID"
-                    if candidate_json_key in muscle_bary_map:
-                        json_key_to_use = candidate_json_key
-                
-                # 3. Attempt: General suffix removal and then check for direct match
-                #    e.g., "Abs_t-pose" -> "Abs" (then check if "Abs" is a JSON key)
-                if json_key_to_use is None:
-                    simplified_actual_name = actual_name.replace("_t-pose", "").replace("_FIX", "").replace("-FIX", "").replace("_a-pose", "")
-                    if simplified_actual_name in muscle_bary_map:
-                        json_key_to_use = simplified_actual_name
-                    else:
-                        # 4. Attempt: Fuzzy match (case-insensitive comparison of simplified names)
-                        #    e.g., "Abs" (from OBJ) vs "Abs" (from JSON key "Abs_a-pose-ID")
-                        for json_key in json_keys:
-                            simplified_json_key = json_key.replace("_a-pose-ID", "").replace("_t-pose", "").replace("_FIX", "").replace("-FIX", "").replace("_a-pose", "")
-                            if simplified_actual_name.lower() == simplified_json_key.lower():
-                                json_key_to_use = json_key # Use the original JSON key
-                                break
-                # --- End Mapping Strategy ---
-                
-                if json_key_to_use is not None:
-                    muscle_name_mapping[actual_name] = json_key_to_use
-                else:
-                    logger.warning(f"No mapping found for OBJ '{actual_name}'. Please check naming conventions.")
-            
-            logger.success(f"[MUSCLE VERTEX MAPPING] Created muscle name mapping: {len(muscle_name_mapping)} files matched to JSON keys")
-            logger.info("============================================")
-            
-            if len(muscle_name_mapping) < len(all_muscle_files):
-                logger.warning(f"[MUSCLE VERTEX MAPPING] Only {len(muscle_name_mapping)}/{len(all_muscle_files)} muscles mapped. Missing:")
-                for actual_file in all_muscle_files:
-                    actual_name = os.path.basename(actual_file).replace(".obj", "")
-                    if actual_name not in muscle_name_mapping:
-                        logger.warning(f"  - {actual_name}")
-    else:
-        logger.warning(f"[MUSCLE VERTEX MAPPING] Map not found at {muscle_vertex_mapping_path}")
+    muscle_binding = {m_name: bind_to_layer(m_data['verts'], musc_layer_vertices_np) for m_name, m_data in preloaded_muscles.items()}
+    logger.success(f"[MUSCLE BINDING] {len(muscle_binding)} muscles bound to the muscle layer")
+    logger.info("============================================")
 
     # ----------------
 
@@ -2074,7 +2017,8 @@ def main():
             # ---- OPTIONAL ----
             active_muscle_mask=active_muscle_mask,
             target_marker_mask=target_marker_mask,
-            stability_mask=stability_mask
+            stability_mask=stability_mask,
+            architecture=CONFIG["architecture"]
         )
 
         logger.success(f"[MODEL] SOMAModel instantiated successfully.")
@@ -2088,6 +2032,31 @@ def main():
         model.deformation_model.load_state_dict(blendshape_weights)
 
         logger.success(f"[MODEL] Weights {CHECKPOINT_PATH} loaded.")
+
+        if CHECKPOINTS[ACTIVE_CHECKPOINT].get("marker_offset"):
+            _eye = torch.eye(3, device=device).view(1, 1, 3, 3).repeat(1, model.j_rest.shape[0], 1, 1)
+            _off = model.calibrate_marker_offset(_eye)
+            logger.warning(f"[MODEL] Marker offset applied (mean {_off.mean().item():.5f}, max {_off.max().item():.5f}).")
+
+        if CHECKPOINTS[ACTIVE_CHECKPOINT].get("zero_disp"):
+            dm = model.deformation_model
+            dm.forward = lambda r, ri: (torch.zeros(r.shape[0], dm.num_vertices, 3, device=r.device),) * 2
+            logger.warning("[MODEL] zero_disp: deformation output forced to 0 (pure LBS).")
+
+        static_canon = CHECKPOINTS[ACTIVE_CHECKPOINT].get("static_canon")
+        static_canon = torch.from_numpy(np.load(static_canon)).float().to(device) if static_canon else None
+        marker_weights = (model.bary_weights.unsqueeze(-1) * model.skin_weights[model.bary_verts]).sum(1)
+        rig_old = None
+        if RIG_PATH and SKIM_VERSION < 2:  # V1 residuals were measured against the original marker LBS: the overlay converts them to the new rig
+            _canon = np.load(os.path.join(PATHS['canonical'], "..", "canonical.npz"))
+            rig_old = (torch.from_numpy(_canon["W"]).float().to(device), torch.from_numpy(_rig["j_rest_captury"]).float().to(device))
+
+        if RIG_PATH:
+            model.shared_bone_weights = True
+
+        if CHECKPOINTS[ACTIVE_CHECKPOINT].get("rigid_correction"):
+            load_rigid_head(model, joint_names_global, CHECKPOINT_PATH, device)
+            logger.warning("[MODEL] Rigid skeleton correction loaded (posed layers follow the corrected skeleton).")
 
         model.eval()
 
@@ -2119,8 +2088,16 @@ def main():
         frame_slider = server.gui.add_slider("Frame", min=0, max=len(validation_files) - 1, step=1, initial_value=0)
         current_file_display = server.gui.add_markdown("Current File: **N/A**")     
     else:
+        # Shot picker: every shot with a packed npz + raw BVH; held-out = in <S>_validation_filepaths.json (split is per shot)
+        val_frames = {os.path.basename(f).removesuffix(".npy") for f in validation_files}
+        held_out_shots = {f.rsplit("_frame_", 1)[0] for f in val_frames}
+        shots = [os.path.basename(f).removesuffix(".npz") for f in sorted(glob.glob(os.path.join(PATHS['processed'], "shot_*.npz")))]
+        shots = [s for s in shots if os.path.exists(os.path.join(PATHS['raw'], f"{s}_captury", f"{SUBJECT}_{s}.bvh"))]
+        shot_label = lambda s: f"{s} (held-out)" if s in held_out_shots else f"{s} (train)"
+        shot_dropdown = server.gui.add_dropdown("Shot", options=[shot_label(s) for s in shots], initial_value=shot_label(SHOT))
         frame_slider = server.gui.add_slider("Frame", min=0, max=max(0, num_frames - 2), step=1, initial_value=0)
         current_file_display = server.gui.add_markdown(f"Current File: **{SHOT}_frame_0000.npy**")
+        split_display = server.gui.add_markdown("")
 
     # BVH
     bvh_global_bool = server.gui.add_checkbox("BVH (Global)", initial_value=False)
@@ -2196,6 +2173,7 @@ def main():
 
     # Residuals
     residuals_gt_bool = server.gui.add_checkbox("Ground Truth Residuals (T-Pose)", initial_value=False)
+    residuals_gt_posed_bool = server.gui.add_checkbox("Observed Markers (Posed, real scale)", initial_value=False)
 
     # Model
     inference_bool = server.gui.add_checkbox("Model Inference", initial_value=False)
@@ -2210,7 +2188,7 @@ def main():
         export_individual_muscles_bool = server.gui.add_checkbox("Export Deformed Muscles", initial_value=False)
         target_muscle_text = server.gui.add_text("Target Muscle (leave empty for all)", initial_value="")
         
-    export_dir_ind_muscle = os.path.join(BASE_DIR, "exported_ind_musc_meshes", f"{SHOT}_captury")
+    export_dir_ind_muscle = os.path.join("exported_ind_musc_meshes", SUBJECT, f"{SHOT}_captury")
     os.makedirs(export_dir_ind_muscle, exist_ok=True)
 
     # ----------------
@@ -2343,12 +2321,11 @@ def main():
     # ====================================================================================
     offset_correction = None
     try:
-        res_path_0 = os.path.join(PATHS['processed'], 'residuals', f"{SHOT}_frame_0000.npy")
+        frame_0 = load_packed_frame(PATHS['processed'], f"{SHOT}_frame_0000")
 
-        if os.path.exists(res_path_0):
-            res_0 = np.load(res_path_0).astype(np.float32).reshape(-1, 3)
-            offset_correction = res_0
-            logger.success(f"[OFFSET FIX] Loaded GLOBAL offset bias from {os.path.basename(res_path_0)}.")
+        if frame_0 is not None:
+            offset_correction = frame_0[1].reshape(-1, 3)
+            logger.success(f"[OFFSET FIX] Loaded GLOBAL offset bias from {SHOT}_frame_0000.")
         else:
             logger.warning("[OFFSET FIX] Could not find Frame 0 residuals. Skipping offset correction.")
     except Exception as e:
@@ -2364,36 +2341,20 @@ def main():
         residuals_gt_for_frame = None
         try:
             if VALIDATION_CLIPS:
-                # Extract base filename from validation_files path
-                pose_filepath = validation_files[current_frame_idx]
-                base_filename = os.path.basename(pose_filepath)
-                residuals_gt_path = os.path.join(PATHS['processed'], 'residuals', base_filename)
-                current_file_display.content = f"Current File: **{base_filename}**"
+                frame_id = validation_files[current_frame_idx]
             else:
-                # Construct filename for non-validation clips
-                # Assuming shot_name is defined globally or passed
-                filename = f"{SHOT}_frame_{current_frame_idx:04d}.npy"
-                residuals_gt_path = os.path.join(PATHS['processed'], 'residuals', filename)
-                current_file_display.content = f"Current File: **{filename}**"
+                frame_id = f"{SHOT}_frame_{current_frame_idx:04d}"
+                split_display.content = "Split: 🔴 **HELD-OUT (validation)**" if frame_id in val_frames else "Split: 🟢 **TRAINING**"
+            current_file_display.content = f"Current File: **{frame_id}**"
 
-            if os.path.exists(residuals_gt_path):
-                residuals_gt_for_frame = np.load(residuals_gt_path).astype(np.float32)
-                
+            frame_gt = load_packed_frame(PATHS['processed'], frame_id)
+            if frame_gt is not None:
+                _, residuals_gt_for_frame, current_mask = frame_gt
+
                 # Reshape from (N*3,) to (N, 3)
                 residuals_gt_for_frame = residuals_gt_for_frame.reshape(-1, 3)
+                current_mask = current_mask.reshape(-1)
 
-                # [NEW] Load the Mask for Visualization Colors
-                # ------------------------------------------------------------------------------------
-                mask_filename = os.path.basename(residuals_gt_path)
-                mask_gt_path = os.path.join(PATHS['processed'], 'masks', mask_filename)
-                
-                if os.path.exists(mask_gt_path):
-                    current_mask = np.load(mask_gt_path).reshape(-1)
-                else:
-                    logger.warning(f"Mask file not found: {mask_gt_path}")
-                    current_mask = None
-                # ------------------------------------------------------------------------------------
-            
                 # ====================================================================================
                 # [FIX] Apply the offset correction
                 # ====================================================================================
@@ -2407,7 +2368,7 @@ def main():
                 # ====================================================================================
 
             else:
-                logger.warning(f"Ground truth residuals file not found for frame {current_frame_idx}: {residuals_gt_path}")
+                logger.warning(f"Ground truth residuals not found for frame {current_frame_idx}: {frame_id}")
         except Exception as e:
             logger.error(f"Error loading ground truth residuals for frame {current_frame_idx}: {e}")
         # ---------------------------------------------------------
@@ -2415,9 +2376,9 @@ def main():
         # ----------------
         # A1. BVH file (Global - RED)
 
-        if bvh_global_bool.value == True:
+        if bvh_global_bool.value == True and not VALIDATION_CLIPS: # no raw-BVH frame for a validation sample
             # 1. Calculate the skeleton's pose relative to its own origin (0,0,0)
-            posed_joints_local_global, _ = fk(local_rotations_global[current_frame_idx], np.zeros(3), offsets_global, parents_global)
+            posed_joints_local_global, _= fk(local_rotations_global[current_frame_idx], np.zeros(3), offsets_global, parents_global)
 
             # 2. Convert to world space by adding the global root position (brings to original world position)
             posed_joints_world_global = posed_joints_local_global + global_positions_global[current_frame_idx, :] # global_positions_global is non-zero
@@ -2502,8 +2463,7 @@ def main():
             # [FIX] Determine the correct pose based on VALIDATION_CLIPS
             # ====================================================================
             if VALIDATION_CLIPS:
-                pose_filepath = validation_files[current_frame_idx]
-                rotation_vector = np.load(pose_filepath) # Shape: (144,)
+                rotation_vector = load_packed_frame(PATHS['processed'], validation_files[current_frame_idx])[0] # Shape: (144,)
                 num_j = len(rotation_vector) // 6
                 
                 # 1. Load exactly like the model does
@@ -2518,6 +2478,12 @@ def main():
                 current_quats = np.concatenate([quats_xyzw[:, 3:4], quats_xyzw[:, :3]], axis=1) # [w, x, y, z]
                 
                 current_root_pos = np.zeros(3) # Root is centered in processed clips
+            elif (packed := load_packed_frame(PATHS['processed'], f"{SHOT}_frame_{current_frame_idx:04d}")) is not None:
+                # Packed training pose, as in Model Inference: the BVH path below has an extra Rz(90) on the root and
+                # lags one frame (packed pose[i] = BVH frame i+1)
+                quats_xyzw = Rotation.from_matrix(sixd_to_rotmat(torch.from_numpy(packed[0]).float().view(-1, 6)).numpy()).as_quat()
+                current_quats = np.concatenate([quats_xyzw[:, 3:4], quats_xyzw[:, :3]], axis=1) # [w, x, y, z]
+                current_root_pos = np.zeros(3)
             else:
                 current_quats = reconstructed_6d_local_rotations[current_frame_idx]
                 current_root_pos = global_positions_6d[current_frame_idx, :]
@@ -2562,7 +2528,7 @@ def main():
                 axis_len = float(hips_axes_len.value)
 
                 # Root rotation matrix from BVH quaternions
-                pose_rotations_tensor_axes_6d = torch.from_numpy(reconstructed_6d_local_rotations[current_frame_idx]).float() # < ------------------------------------ TENSOR
+                pose_rotations_tensor_axes_6d = torch.from_numpy(current_quats).float() # < ------------------------------------ TENSOR
                 rot_mats_axes = quat_torch.to_matrix(pose_rotations_tensor_axes_6d)  # (J, 3, 3)
                 R0_6d = rot_mats_axes[0].cpu().numpy()  # hips/global root
 
@@ -2663,8 +2629,7 @@ def main():
             
             # B. Prepare current pose from BVH (6D continuous representation)
             if VALIDATION_CLIPS:
-                pose_filepath = validation_files[current_frame_idx]
-                rotation_vector = np.load(pose_filepath) # Shape: (144,)
+                rotation_vector = load_packed_frame(PATHS['processed'], validation_files[current_frame_idx])[0] # Shape: (144,)
                 num_joints_from_file = len(rotation_vector) // 6
                 
                 # Use a unique variable name (rot6d_tensor_inf) and ensure it has a batch dimension (1, 24, 6)
@@ -2672,15 +2637,25 @@ def main():
                 
                 root_position = torch.zeros(1, 3, device=device, dtype=s_bind.dtype)
             else:
-                rot6d = continuous[current_frame_idx]  # (24, 3, 2)
-                rot6d_flat = np.concatenate([rot6d[..., 0], rot6d[..., 1]], axis=-1)  # (24, 6)
+                # Prefer the packed training pose of this frame: same root convention as 01/03 (the BVH path below adds an
+                # extra 90 deg Z on the root, which lays the posed body down) and the same frame as the GT residuals.
+                packed = load_packed_frame(PATHS['processed'], f"{SHOT}_frame_{current_frame_idx:04d}")
+                if packed is not None:
+                    rot6d_tensor_inf = torch.from_numpy(packed[0]).float().view(1, -1, 6).to(device)
+                else:
+                    rot6d = continuous[current_frame_idx]  # (24, 3, 2)
+                    rot6d_flat = np.concatenate([rot6d[..., 0], rot6d[..., 1]], axis=-1)  # (24, 6)
 
-                # Use a unique variable name (rot6d_tensor_inf)
-                rot6d_tensor_inf = torch.from_numpy(rot6d_flat).float().unsqueeze(0).to(device)  # (1, 24, 6)
-                
+                    # Use a unique variable name (rot6d_tensor_inf)
+                    rot6d_tensor_inf = torch.from_numpy(rot6d_flat).float().unsqueeze(0).to(device)  # (1, 24, 6)
+
                 root_position = torch.from_numpy(local_positions_6d[current_frame_idx, 0, :]).float().to(device).unsqueeze(0)  # (1, 3)
 
             rot_mats = sixd_to_rotmat(rot6d_tensor_inf) # (B, J, 3, 3)
+            rot6d_bvh = rot6d_tensor_inf  # the residuals were measured with this pose (original-rig LBS)
+            if FOREARM_DETWIST and not (SKIM_VERSION >= 2 and (VALIDATION_CLIPS or packed is not None)):  # V2 packed poses are already de-twisted
+                rot6d_tensor_inf = rotmat_to_sixd(detwist(rot_mats, model.j_rest, joint_names_global, model.parents))
+                rot_mats = sixd_to_rotmat(rot6d_tensor_inf)
             
             # C. Root position
             if VALIDATION_CLIPS:
@@ -2727,8 +2702,8 @@ def main():
                     # --------------------------------------------------------------------------------
                     # NEW: Export Unified Individual Muscles
                     # --------------------------------------------------------------------------------
-                    if export_unified_indiv.value and skin_verts_raw is not None and muscle_bary_map is not None:
-                        skin_verts_deformed = s_final.detach().cpu().numpy()[0]
+                    if export_unified_indiv.value:
+                        musc_disp = (m_final[0] - m_bind).detach().cpu().numpy()
                         all_unified_verts = []
                         all_unified_faces = []
                         vertex_offset = 0
@@ -2736,33 +2711,8 @@ def main():
                         unified_ranges = {}
                         
                         for m_name, m_data in preloaded_muscles.items():
-                            json_key = muscle_name_mapping.get(m_name, m_name)
-                            muscle_verts_raw = m_data['verts']
                             muscle_faces_raw = m_data['faces']
-                            muscle_verts_deformed = muscle_verts_raw.copy()
-                            
-                            # Apply Deformation
-                            if json_key in muscle_bary_map:
-                                target_data = muscle_bary_map[json_key]
-                                for k, data in target_data.items():
-                                    try:
-                                        local_idx = int(k)
-                                        if local_idx < len(muscle_verts_raw):
-                                            tri_idx = data['tri_idx']
-                                            bary = data['bary']
-                                            if tri_idx < len(skin_faces_raw):
-                                                f_indices = skin_faces_raw[tri_idx]
-                                                
-                                                # Rest vs Deformed
-                                                v1_r, v2_r, v3_r = skin_verts_raw[f_indices]
-                                                p_skin_rest = (bary[0]*v1_r) + (bary[1]*v2_r) + (bary[2]*v3_r)
-                                                
-                                                v1_d, v2_d, v3_d = skin_verts_deformed[f_indices]
-                                                p_skin_deformed = (bary[0]*v1_d) + (bary[1]*v2_d) + (bary[2]*v3_d)
-                                                
-                                                # Transfer Delta
-                                                muscle_verts_deformed[local_idx] += (p_skin_deformed - p_skin_rest)
-                                    except: pass
+                            muscle_verts_deformed = transfer(m_data['verts'], *muscle_binding[m_name], musc_disp)
                             
                             # Track ranges before appending
                             v_start = vertex_offset
@@ -2801,104 +2751,76 @@ def main():
                 # ====================================================================================
                 if show_individual_muscles_bool.value or export_individual_muscles_bool.value:
                     
-                    # 1. Prepare Deformed Skin
-                    skin_verts_deformed = s_final.detach().cpu().numpy()[0]
+                    # 1. Muscle-layer displacement (T-pose)
+                    musc_disp = (m_final[0] - m_bind).detach().cpu().numpy()
                     
-                    if skin_verts_raw is not None and muscle_bary_map is not None:
-                        target_name = target_muscle_text.value.strip()
+                    target_name = target_muscle_text.value.strip()
                         
-                        if export_individual_muscles_bool.value:
-                            frame_export_dir = os.path.join(export_dir_ind_muscle, f"frame_{current_frame_idx:04d}")
-                            os.makedirs(frame_export_dir, exist_ok=True)
+                    if export_individual_muscles_bool.value:
+                        frame_export_dir = os.path.join(export_dir_ind_muscle, f"frame_{current_frame_idx:04d}")
+                        os.makedirs(frame_export_dir, exist_ok=True)
                         
-                        processed_count = 0
+                    processed_count = 0
 
-                        for m_name, m_data in preloaded_muscles.items():
-                            json_key = muscle_name_mapping.get(m_name, m_name)
+                    for m_name, m_data in preloaded_muscles.items():
+                        # Filter logic
+                        should_show = (not target_name) or (target_name in m_name)
                             
-                            # Filter logic
-                            should_show = (not target_name) or (target_name in m_name)
-                            
-                            if not should_show and not export_individual_muscles_bool.value:
+                        if not should_show and not export_individual_muscles_bool.value:
+                            server.scene.remove_by_name(f"/model/tpose/deformed_muscles/{m_name}")
+                            server.scene.remove_by_name(f"/model/tpose/deformed_muscles_wireframe/{m_name}")
+                            continue
+                                
+                        try:
+                            # A. Rest Pose Data
+                            muscle_verts_raw = m_data['verts']
+                            muscle_faces_raw = m_data['faces']
+                                
+                            # B. Transfer the displacement through the binding
+                            muscle_verts_deformed = transfer(muscle_verts_raw, *muscle_binding[m_name], musc_disp)
+                                
+                            # C. Export
+                            if export_individual_muscles_bool.value:
+                                out_path = os.path.join(frame_export_dir, f"{m_name}.obj")
+                                tm = trimesh.Trimesh(vertices=muscle_verts_deformed, faces=muscle_faces_raw, process=False)
+                                tm.export(out_path)
+                                processed_count += 1
+                                    
+                            # D. Visualize
+                            if show_individual_muscles_bool.value and should_show:
+                                import hashlib
+                                hash_obj = hashlib.md5(m_name.encode())
+                                r = int(hash_obj.hexdigest()[0:2], 16)
+                                g = int(hash_obj.hexdigest()[2:4], 16)
+                                b = int(hash_obj.hexdigest()[4:6], 16)
+                                        
+                                server.scene.add_mesh_simple(
+                                    name=f"/model/tpose/deformed_muscles/{m_name}",
+                                    vertices=muscle_verts_deformed,
+                                    faces=muscle_faces_raw,
+                                    color=(r, g, b),
+                                    opacity=1,
+                                    wireframe=False,
+                                    side="double"
+                                )
+                                server.scene.add_mesh_simple(
+                                    name=f"/model/tpose/deformed_muscles_wireframe/{m_name}",
+                                    vertices=muscle_verts_deformed,
+                                    faces=muscle_faces_raw,
+                                    color=(50, 0, 0),
+                                    opacity=0.3,
+                                    wireframe=True,
+                                    side="double"
+                                )
+                            else:
                                 server.scene.remove_by_name(f"/model/tpose/deformed_muscles/{m_name}")
                                 server.scene.remove_by_name(f"/model/tpose/deformed_muscles_wireframe/{m_name}")
-                                continue
+                        except Exception as e:
+                            pass
                                 
-                            try:
-                                # A. Rest Pose Data
-                                muscle_verts_raw = m_data['verts']
-                                muscle_faces_raw = m_data['faces']
-                                muscle_verts_deformed = muscle_verts_raw.copy()
-                                
-                                # B. Apply Deltas via Barycentric JSON Map
-                                if json_key in muscle_bary_map:
-                                    target_data = muscle_bary_map[json_key]
-                                    
-                                    for k, data in target_data.items():
-                                        try:
-                                            local_idx = int(k)
-                                            if local_idx < len(muscle_verts_raw):
-                                                tri_idx = data['tri_idx']
-                                                bary = data['bary']
-                                                
-                                                if tri_idx < len(skin_faces_raw):
-                                                    f_indices = skin_faces_raw[tri_idx]
-                                                    
-                                                    # Position on REST Skin
-                                                    v1_r, v2_r, v3_r = skin_verts_raw[f_indices]
-                                                    p_skin_rest = (bary[0] * v1_r) + (bary[1] * v2_r) + (bary[2] * v3_r)
-                                                    
-                                                    # Position on DEFORMED Skin (s_final)
-                                                    v1_d, v2_d, v3_d = skin_verts_deformed[f_indices]
-                                                    p_skin_deformed = (bary[0] * v1_d) + (bary[1] * v2_d) + (bary[2] * v3_d)
-                                                    
-                                                    # Transfer Delta
-                                                    delta = p_skin_deformed - p_skin_rest
-                                                    muscle_verts_deformed[local_idx] += delta
-                                        except: pass
-                                    
-                                    # C. Export
-                                    if export_individual_muscles_bool.value:
-                                        out_path = os.path.join(frame_export_dir, f"{m_name}.obj")
-                                        tm = trimesh.Trimesh(vertices=muscle_verts_deformed, faces=muscle_faces_raw, process=False)
-                                        tm.export(out_path)
-                                        processed_count += 1
-                                    
-                                    # D. Visualize
-                                    if show_individual_muscles_bool.value and should_show:
-                                        import hashlib
-                                        hash_obj = hashlib.md5(m_name.encode())
-                                        r = int(hash_obj.hexdigest()[0:2], 16)
-                                        g = int(hash_obj.hexdigest()[2:4], 16)
-                                        b = int(hash_obj.hexdigest()[4:6], 16)
-                                        
-                                        server.scene.add_mesh_simple(
-                                            name=f"/model/tpose/deformed_muscles/{m_name}",
-                                            vertices=muscle_verts_deformed,
-                                            faces=muscle_faces_raw,
-                                            color=(r, g, b),
-                                            opacity=1,
-                                            wireframe=False,
-                                            side="double"
-                                        )
-                                        server.scene.add_mesh_simple(
-                                            name=f"/model/tpose/deformed_muscles_wireframe/{m_name}",
-                                            vertices=muscle_verts_deformed,
-                                            faces=muscle_faces_raw,
-                                            color=(50, 0, 0),
-                                            opacity=0.3,
-                                            wireframe=True,
-                                            side="double"
-                                        )
-                                    else:
-                                        server.scene.remove_by_name(f"/model/tpose/deformed_muscles/{m_name}")
-                                        server.scene.remove_by_name(f"/model/tpose/deformed_muscles_wireframe/{m_name}")
-                            except Exception as e:
-                                pass
-                                
-                        if export_individual_muscles_bool.value:
-                            logger.success(f"[EXPORT] Saved {processed_count} muscles to {frame_export_dir}")
-                            export_individual_muscles_bool.value = False # Auto-toggle off after 1 frame to prevent spam
+                    if export_individual_muscles_bool.value:
+                        logger.success(f"[EXPORT] Saved {processed_count} muscles to {frame_export_dir}")
+                        export_individual_muscles_bool.value = False # Auto-toggle off after 1 frame to prevent spam
                 else:
                     # Cleanup scene if toggled off
                     for m_name in preloaded_muscles.keys():
@@ -2970,7 +2892,7 @@ def main():
 
                     server.scene.add_point_cloud(
                         name="/model/theta/p_pred_theta_filtered",
-                        points=p_pred_theta_filtered.squeeze(0).cpu().numpy(),
+                        points=p_pred_theta_filtered,
                         colors=(150, 150, 255), # Cyan
                         point_size=0.003
                     )
@@ -3002,6 +2924,31 @@ def main():
                     server.scene.remove_by_name("/model/theta/p_pred_theta_filtered")
                     server.scene.remove_by_name("/model/theta/p_bind_theta + delta_pred")
                     server.scene.remove_by_name("/model/theta/correspondence_changes_pose_space")
+
+                # Observed markers in posed space at real scale: posed LBS markers + residual rotated into the model frame
+                # (stored residuals = (observed - LBS) * 0.1, posed world Z-up). Orange lines: prediction -> observation.
+                # With a "static_canon" checkpoint (trained with --residual-static-removal) the bone-frame static part is
+                # subtracted, i.e. the overlay shows the pose-dependent target the model was trained on.
+                if residuals_gt_posed_bool.value and residuals_gt_for_frame is not None:
+                    obs_mask = mask & (current_mask > 0)
+                    r_posed = residuals_gt_for_frame @ (Rotation.from_euler('y', 90, degrees=True) * Rotation.from_euler('x', -90, degrees=True)).as_matrix().T  # world Z-up -> model posed frame
+                    if static_canon is not None:
+                        rot_inf = sixd_to_rotmat(rot6d_tensor_inf)
+                        glob_rot = []
+                        for i in range(rot_inf.shape[1]):
+                            glob_rot.append(rot_inf[:, i] if model.parents[i] == -1 else glob_rot[model.parents[i]] @ rot_inf[:, i])
+                        marker_rot = torch.einsum('mj,bjxy->bmxy', marker_weights, torch.stack(glob_rot, dim=1))[0]
+                        r_posed = r_posed - (marker_rot @ static_canon.unsqueeze(-1)).squeeze(-1).cpu().numpy()
+                    if rig_old is not None:
+                        rot_inf = sixd_to_rotmat(rot6d_tensor_inf); _P, _z = model.p_bind.unsqueeze(0), torch.zeros(1, 3, device=device)
+                        r_posed = r_posed + 0.1 * (lbs_working_batch_rotmat(_P, sixd_to_rotmat(rot6d_bvh), rig_old[0], rig_old[1], model.parents, _z)
+                                                   - lbs_working_batch_rotmat(_P, rot_inf, marker_weights, model.j_rest, model.parents, _z))[0].cpu().numpy()
+                    gt_posed = p_bind_theta.squeeze(0).cpu().numpy() + r_posed * 10.0
+                    server.scene.add_point_cloud(name="/GT_posed/observed", points=gt_posed[obs_mask], colors=(0, 180, 0), point_size=0.004)
+                    server.scene.add_line_segments(name="/GT_posed/error", points=np.stack([p_pred_theta.squeeze(0).cpu().numpy()[obs_mask], gt_posed[obs_mask]], axis=1), line_width=2.0, colors=(255, 140, 0))
+                else:
+                    server.scene.remove_by_name("/GT_posed/observed")
+                    server.scene.remove_by_name("/GT_posed/error")
 
                 if output_final_tpose_bool.value == True:
                     server.scene.add_mesh_simple(
@@ -3084,6 +3031,7 @@ def main():
     @bvh_6d_bool.on_update
     @hips_axes_bool.on_update
     @residuals_gt_bool.on_update
+    @residuals_gt_posed_bool.on_update
     @output_final_theta_bool.on_update
     @inference_bool.on_update
     @output_final_tpose_bool.on_update
@@ -3106,6 +3054,32 @@ def main():
 
             # 3. Call update with the found camera
             update_scene(camera)
+
+    if not VALIDATION_CLIPS:
+        @shot_dropdown.on_update
+        def _(event: viser.GuiEvent) -> None:
+            nonlocal SHOT, export_dir_ind_muscle, local_rotations_global, global_positions_global
+            nonlocal reconstructed_6d_local_rotations, global_positions_6d, local_positions_6d, continuous
+            new_shot = shot_dropdown.value.split(" ")[0]
+            if new_shot == SHOT:
+                return
+            logger.info(f"[SHOT] Switching to {new_shot} ({'held-out' if new_shot in held_out_shots else 'train'})...")
+            motion = load_shot_motion(os.path.join(PATHS['raw'], f"{new_shot}_captury", f"{SUBJECT}_{new_shot}.bvh"), SCALE)
+            local_rotations_global, global_positions_global, reconstructed_6d_local_rotations, global_positions_6d, local_positions_6d, continuous = motion
+            SHOT = new_shot
+            export_dir.value = f"./exports_multiple/{SUBJECT}/{SHOT}"
+            export_dir_ind_muscle = os.path.join("exported_ind_musc_meshes", SUBJECT, f"{SHOT}_captury")
+            os.makedirs(export_dir_ind_muscle, exist_ok=True)
+            logger.success(f"[SHOT] {SHOT}: {continuous.shape[0]} frames.")
+
+            # Restart at frame 0: setting the slider re-renders, unless it already was 0
+            was_zero = frame_slider.value == 0
+            frame_slider.value = 0
+            frame_slider.max = max(0, continuous.shape[0] - 2)
+            if was_zero:
+                clients = server.get_clients()
+                camera = event.client.camera if event.client is not None else (list(clients.values())[0].camera if clients else None)
+                update_scene(camera)
 
     # Initial call to update_scene, handling potential lack of clients
     if server.get_clients():

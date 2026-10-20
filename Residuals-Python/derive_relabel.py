@@ -1,7 +1,7 @@
 """
 derive_relabel.py -- recover the proc_ID -> canonical_ID relabeling for S4/S5.
 
-The Dec-2025 captures (Mona/S4, Sarah/S5) label triangulated markers with IDs that do
+The Dec-2025 captures (S4, S5) label triangulated markers with IDs that do
 not match the canonical model's IDs (the point clouds match geometrically, the labels
 don't). This script derives a per-subject relabeling map by matching, frame by frame,
 each proc marker (centroid of its 4 corners) against the *Blender-recovered observed*
@@ -22,8 +22,9 @@ Output: relabel_<S>.json next to this script:
 perm semantics: proc corner j corresponds to canonical corner perm[j].
 
 Run:
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python derive_relabel.py S4 S5
+  python derive_relabel.py S4 S5
 """
+import os
 import sys
 import json
 import itertools
@@ -141,7 +142,7 @@ def derive(S):
     costs = np.array([m["cost_cm"] for m in mapping.values()])
     if len(costs):
         print(f"[{S}] mapping cost: median={np.median(costs):.2f}cm p90={np.percentile(costs,90):.2f}cm")
-    out = f"/CT/SOMA/work/Residuals-Python/relabel_{S}.json"
+    out = os.path.join(os.path.dirname(os.path.abspath(__file__)), f"relabel_{S}.json")
     with open(out, "w") as fo:
         json.dump({"map": mapping, "stats": stats}, fo, indent=1)
     print(f"[{S}] wrote {out}")

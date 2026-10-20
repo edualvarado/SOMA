@@ -5,10 +5,10 @@ import os
 
 SHOT = "shot_001"
 
-# OBJ_DIR = rf"C:\Users\Eduardo\00-Local\Blender\SOMA\exports_multiple\S1\{SHOT}"
+# OBJ_DIR = rf"path/to/exports_multiple/S1/{SHOT}"
 
 SUB = "S4"
-OBJ_DIR = rf"C:\Users\Eduardo\00-Local\Blender\SOMA\exports_multiple\{SUB}\validation\validation_600_900"
+OBJ_DIR = rf"path/to/exports_multiple/{SUB}/validation/validation_600_900"  # folder with the exported OBJ frames
 
 
 # PREFIX = "skin_frame_"              

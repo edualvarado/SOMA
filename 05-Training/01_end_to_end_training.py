@@ -1,5 +1,7 @@
 import os
 import glob
+import random
+import argparse
 import json
 import time
 import numpy as np
@@ -26,6 +28,7 @@ import pymotion.rotations.ortho6d as sixd
 import pymotion.rotations.quat as quat
 import pymotion.rotations.quat_torch as quat_torch
 import pymotion.ops.skeleton as sk
+from forearm_detwist import detwist, rotmat_to_sixd
 
 # Quick class to calculate prisms volume
 class PrismVolumeLoss(torch.nn.Module):
@@ -74,11 +77,11 @@ class PrismVolumeLoss(torch.nn.Module):
         # No .abs() here. We want negative volume if inverted!
         return 0.25 * (detJ_1 + detJ_2)
 
-    def forward(self, curr_inner_verts, curr_outer_verts, rest_volume, faces):
+    def forward(self, curr_inner_verts, curr_outer_verts, rest_volume, faces, patch=None):
         # 1. Compute current signed volume
         curr_vol = self.compute_prism_volume(curr_inner_verts, curr_outer_verts, faces)
         # Squeeze rest_volume to 1D (F,)
-        rest_vol_1d = rest_volume.squeeze()        
+        rest_vol_1d = rest_volume.squeeze()
 
         # Safety mask: Ignore perfectly welded/flat geometry to prevent division by zero
         valid_mask = rest_vol_1d.abs() > 1e-7
@@ -87,7 +90,21 @@ class PrismVolumeLoss(torch.nn.Module):
 
         curr_vol_valid = curr_vol[:, valid_mask]
         rest_vol_valid = rest_vol_1d[valid_mask]
-        
+
+        if patch is not None:
+            # Preserve the total volume of each patch (F,) of prisms instead of every prism: volume may move
+            # inside a patch (folds). Patches weigh by their prism count, so all-singleton patches == per-prism.
+            p = patch[valid_mask]
+            num_p = int(p.max()) + 1
+            n = torch.zeros(num_p, device=p.device).index_add_(0, p, torch.ones_like(rest_vol_valid))
+            rest_p = torch.zeros(num_p, device=p.device).index_add_(0, p, rest_vol_valid)
+            curr_p = torch.zeros(curr_vol_valid.shape[0], num_p, device=p.device).index_add_(1, p, curr_vol_valid)
+            mean_vol = rest_vol_valid.abs().mean().clamp(min=1e-8)
+            denom = rest_p.abs() + 0.1 * mean_vol * n + 1e-12
+            diff = curr_p - rest_p
+            err = (diff / denom).pow(2) if VOL_LOSS == "rel" else diff.pow(2) / denom
+            return (err * n).sum(dim=1).mean() / n.sum()
+
         # 2. Calculate Absolute Volume Difference: (V - V0)
         diff = curr_vol_valid - rest_vol_valid        
 
@@ -100,9 +117,81 @@ class PrismVolumeLoss(torch.nn.Module):
         
         # 4. Final Energy Calculation: (V - V0)^2 / (|V0| + epsilon)
         weighted_error = diff.pow(2) / safe_denom
-        
+        if VOL_LOSS == "rel":
+            # Squared relative change ((V - V0) / (|V0| + epsilon))^2: every prism counts equally, like 03's metric
+            weighted_error = (diff / safe_denom).pow(2)
+
         # MEAN over the mesh, Mean over the batch
         return weighted_error.mean()
+
+    def inversion(self, curr_inner_verts, curr_outer_verts, rest_volume, faces):
+        # Per-prism penalty on inverted prisms (layers passing through each other): patch sums are signed,
+        # so an inverted prism could otherwise be paid for by inflating its neighbours.
+        curr_vol = self.compute_prism_volume(curr_inner_verts, curr_outer_verts, faces)
+        rest = rest_volume.squeeze()
+        valid = rest.abs() > 1e-7
+        rest, curr = rest[valid], curr_vol[:, valid]
+        denom = rest.abs() + 0.1 * rest.abs().mean().clamp(min=1e-8)
+        return (torch.relu(-curr * torch.sign(rest)) / denom).pow(2).mean()
+
+
+def blended_vertex_rotate(vecs, rot_mats, weights, parents):
+    """Rotate per-vertex vectors (B,V,3) by each vertex's blended rotation: the normalised quaternion blend of the
+    global joint rotations (the rotation part of dual-quaternion skinning). Unlike the LBS matrix sum_j w_j R_j it
+    never shrinks, so a correction keeps its size in blend zones (waist, hips, shoulders)."""
+    glob = []
+    for i in range(rot_mats.shape[1]):
+        glob.append(rot_mats[:, i] if parents[i] == -1 else glob[parents[i]] @ rot_mats[:, i])
+    q = quat_torch.from_matrix(torch.stack(glob, dim=1))                 # (B,J,4) wxyz
+    sgn = torch.sign((q.unsqueeze(2) * q.unsqueeze(1)).sum(-1))           # (B,J,J): hemisphere of q_j w.r.t. q_k
+    sgn = torch.where(sgn == 0, torch.ones_like(sgn), sgn)
+    qv = (weights.unsqueeze(0) * sgn[:, weights.argmax(dim=1), :]) @ q   # (B,V,4), aligned to the dominant joint
+    qv = qv / qv.norm(dim=-1, keepdim=True).clamp(min=1e-8)               # zero-weight vertices -> zero -> identity below
+    w, u = qv[..., :1], qv[..., 1:]
+    t = 2.0 * torch.cross(u, vecs, dim=-1)
+    return vecs + w * t + torch.cross(u, t, dim=-1)
+
+
+def geodesic_face_patches(verts, faces, radius):
+    """Patch label per face: farthest-point seeds on the face-adjacency graph until every face is within
+    `radius` (geodesic, metres) of a seed; each face joins its nearest seed."""
+    from scipy.sparse.csgraph import dijkstra
+    c = verts[faces].mean(1)
+    e = np.sort(np.concatenate([faces[:, [0, 1]], faces[:, [1, 2]], faces[:, [2, 0]]]), axis=1)
+    fid = np.tile(np.arange(len(faces)), 3)
+    order = np.lexsort((e[:, 1], e[:, 0]))
+    e, fid = e[order], fid[order]
+    same = np.all(e[1:] == e[:-1], axis=1)
+    a, b = fid[:-1][same], fid[1:][same]
+    w = np.linalg.norm(c[a] - c[b], axis=1) + 1e-9
+    graph = sp.coo_matrix((np.r_[w, w], (np.r_[a, b], np.r_[b, a])), shape=(len(faces),) * 2).tocsr()
+    dist, seeds = np.full(len(faces), np.inf), []
+    while True:
+        s = int(np.argmax(dist))  # farthest face; unreached components (inf) come first
+        if dist[s] <= radius:
+            break
+        seeds.append(s)
+        dist = np.minimum(dist, dijkstra(graph, indices=s, limit=4 * radius))
+    _, _, src = dijkstra(graph, indices=seeds, min_only=True, return_predecessors=True)
+    seed_id = np.full(len(faces), -1)
+    seed_id[seeds] = np.arange(len(seeds))
+    return seed_id[src]
+
+
+def muscle_footprint_patches(verts, faces, muscle_dir, max_dist=0.02):
+    """Patch label per face: the individual muscle nearest to the face centroid (within max_dist metres);
+    faces with no muscle nearby (head, ...) each get their own patch, i.e. stay per-prism."""
+    pts, lab = [], []
+    for i, f in enumerate(sorted(glob.glob(os.path.join(muscle_dir, "*.obj")))):
+        v, _ = load_obj_simple(f)
+        pts.append(v)
+        lab.append(np.full(len(v), i))
+    pts, lab = np.concatenate(pts), np.concatenate(lab)
+    d, j = KDTree(pts).query(verts[faces].mean(1))
+    out = lab[j]
+    far = d > max_dist
+    out[far] = out.max() + 1 + np.arange(far.sum())
+    return np.unique(out, return_inverse=True)[1]
 
         # # 3. Create a Numerically Safe Denominator
         # mean_vol = rest_vol_valid.abs().mean().clamp(min=1e-8)
@@ -305,10 +394,12 @@ def visualize_output(p_bind, residuals_gt, p_pred, skin_layer, musc_layer, posed
 
 # --- MODEL FUNCTIONS ---
 
-def lbs_working_batch_rotmat(vertices, rot_mats, weights, j_rest, parents, root_position):
+def lbs_working_batch_rotmat(vertices, rot_mats, weights, j_rest, parents, root_position, corr=None):
     """
     LBS given rotation matrices.
     vertices: (B,V,3), rot_mats: (B,J,3,3), weights: (V,J), j_rest: (J,3), parents: (J,), root_position: (B,3)
+    corr: optional (B,J,4,4) rigid correction per joint, right-multiplied onto its local transform (joint frame;
+          propagates to the children)
     """
     batch_size = vertices.shape[0]
     num_joints = j_rest.shape[0]
@@ -333,22 +424,43 @@ def lbs_working_batch_rotmat(vertices, rot_mats, weights, j_rest, parents, root_
         G_rest[:, i] = T
     G_rest_inv = torch.inverse(G_rest)
 
-    G_posed = torch.zeros_like(G_rest)
+    G_posed = []  # list, not in-place writes: the rigid correction needs gradients through the chain
     for i in range(num_joints):
         T_local = ident4.clone()
         T_local[:, :3, :3] = rot_mats[:, i]
         if parents[i] == -1:
             T_local[:, :3, 3] = root_position
-            G_posed[:, i] = T_local
         else:
             T_local[:, :3, 3] = (j_rest[i] - j_rest[parents[i]]).unsqueeze(0)
-            G_posed[:, i] = G_posed[:, parents[i]] @ T_local
+        if corr is not None:
+            T_local = T_local @ corr[:, i]
+        G_posed.append(T_local if parents[i] == -1 else G_posed[parents[i]] @ T_local)
 
-    skinning = G_posed @ G_rest_inv
+    skinning = torch.stack(G_posed, dim=1) @ G_rest_inv
     homo = torch.cat([vertices, torch.ones(batch_size, vertices.shape[1], 1, device=device, dtype=vertices.dtype)], dim=-1)
     blended = torch.einsum('vj,bjmn->bvmn', weights, skinning)
     out = blended @ homo.unsqueeze(-1)
     return out[:, :, :3, 0]
+
+def global_rotations(rot_mats, parents):
+    """Global joint rotations (B,J,3,3) from local ones; equals the rotation part of LBS's skinning matrices."""
+    G = [None] * rot_mats.shape[1]
+    for i in range(rot_mats.shape[1]):
+        G[i] = rot_mats[:, i] if parents[i] == -1 else G[parents[i]] @ rot_mats[:, i]
+    return torch.stack(G, dim=1)
+
+# Stored residuals live in the posed world frame (Z-up) = rot_x(+90) @ raw-BVH frame. The model's posed frame is the
+# raw-BVH frame rotated by the root fix of the packed poses, Ry(+90) (exact fit of the marker LBS, all frames). S1: global_R ~ I.
+RESIDUAL_TO_MODEL = torch.from_numpy((Rotation.from_euler('y', 90, degrees=True) * Rotation.from_euler('x', -90, degrees=True)).as_matrix()).float()
+
+def marker_centroids(pred, target, masks):
+    """Centroids (B,1,3) of predicted and target markers. With --data-norm visible, only markers
+    with mask=1 count (hidden markers sit at p_bind in the target and would bias it)."""
+    if DATA_NORM == "visible":
+        w = masks.unsqueeze(-1).to(pred.dtype)
+        n = w.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return (pred * w).sum(dim=1, keepdim=True) / n, (target * w).sum(dim=1, keepdim=True) / n
+    return pred.mean(dim=1, keepdim=True), target.mean(dim=1, keepdim=True)
 
 def barycentric_interpolation_batch(deformed_vertices, bary_verts, bary_weights):
     """
@@ -454,10 +566,10 @@ def sixd_to_rotmat(sixd_reps):
 
 # --- LBS FUNCTIONS ---
 
-def convert_weights_to_npy(json_path, num_rows, output_path, bvh_joint_names, is_skin=True, canonical_ids=None):
+def convert_weights_to_npy(json_path, num_rows, bvh_joint_names, is_skin=True, canonical_ids=None):
     """
-    Generic function to convert skin or marker weights to a dense .npy matrix,
-    using bone names to ensure correct joint ordering.
+    Generic function to convert skin or marker weights to a dense matrix,
+    using bone names to ensure correct joint ordering. Nothing is written: the dataset stays read-only.
     """
     logger.debug(f"[LBS] Converting weights from {os.path.basename(json_path)} to .npy...")
     with open(json_path, 'r') as f:
@@ -493,8 +605,7 @@ def convert_weights_to_npy(json_path, num_rows, output_path, bvh_joint_names, is
                         correct_joint_idx = joint_name_to_index[bone_name]
                         weights_matrix[v_idx, correct_joint_idx] = weight
 
-    np.save(output_path, weights_matrix)
-    logger.debug(f"[LBS] Successfully converted and saved weights to {output_path}")
+    logger.debug(f"[LBS] Successfully converted weights from {os.path.basename(json_path)}")
     return weights_matrix
 
 # --- SKELETON FUNCTIONS ---
@@ -669,7 +780,7 @@ def load_and_stack_muscles(muscle_dir, file_pattern="*.obj"):
         # 3. Calculate Independent Laplacian (Uniform is safer)
         # This Laplacian ONLY knows about this specific muscle.
         # [FIX] Use cotangent weights if possible for better physics, but uniform is stable
-        L_sub = laplacian_calculation(mesh, equal_weight=True)
+        L_sub = uniform_laplacian(mesh)
         laplacians.append(L_sub)
         
         # 4. Store Ranges for VERTICES
@@ -700,6 +811,15 @@ def load_and_stack_muscles(muscle_dir, file_pattern="*.obj"):
     L_block_diag = sp.block_diag(laplacians, format='coo')
     
     return merged_vertices, merged_faces, L_block_diag, muscle_vertex_ranges, muscle_face_ranges
+
+def uniform_laplacian(trimesh_mesh):
+    """Uniform graph Laplacian L = I - A (L @ d = d_i - mean of the neighbours).
+    trimesh's laplacian_calculation returns only the averaging operator A (for smoothing v <- A v); used on its
+    own as a smoothness penalty it rewards high-frequency noise. --legacy-laplacian keeps that old behaviour."""
+    A = laplacian_calculation(trimesh_mesh, equal_weight=True)
+    if LEGACY_LAPLACIAN:
+        return A
+    return (sp.identity(A.shape[0], format="csr", dtype=A.dtype) - A).tocoo()
 
 def calculate_vertex_mass(trimesh_mesh, device):
     """
@@ -837,7 +957,7 @@ def compute_mesh_properties(trimesh_obj, device):
     vertex_mass = calculate_vertex_mass(trimesh_obj, device)
     
     # --- LAPLACIAN ---
-    laplacian_sp = laplacian_calculation(trimesh_obj, equal_weight=True)
+    laplacian_sp = uniform_laplacian(trimesh_obj)
 
     # --- FACE ADJACENCY (For Normal Consistency) ---
     face_adjacency_np = trimesh_obj.face_adjacency
@@ -878,8 +998,6 @@ def compute_mesh_properties(trimesh_obj, device):
 # Centralized config to keep parameters organized
 CONFIG = {
     "subject": "S1",
-    # Paths (We will build absolute paths dynamically below)
-    "base_path_suffix": r"static00", 
     
     # Training Hyperparameters
     # "learning_rate": 1e-3,
@@ -890,11 +1008,11 @@ CONFIG = {
     "weight_decay": 0.0,
     "train_split": 0.9,
 
-    "architecture": "mlp", # Options: "linear", "mlp", "unet"
+    "architecture": "unet", # Options: "linear", "mlp", "unet"
     
     # System
     "device": "cuda" if torch.cuda.is_available() else "cpu",
-    "num_workers": 4, # Set to 0 if using RAM loading (faster), else 4
+    "num_workers": 0, # Set to 0 if using RAM loading (faster), else 4
     "preload_to_ram": False, # CRITICAL OPTIMIZATION: Load all .npy to RAM
     "testing_dataset": False,
     
@@ -905,6 +1023,22 @@ CONFIG = {
 
     "checkpoint_path": None # Path to the file just saved}
 }
+
+# Hips rest offset (m, BVH frame). The raw Captury BVHs of S2-S5 have Hips OFFSET 0 0 0, which puts the
+# rest skeleton ~0.85 m below the mesh. Estimated from the layer meshes (calibrated on S1's re-exported BVH).
+HIPS_REST_OFFSET = {
+    "S2": (-0.002, 0.876, -0.075),
+    "S3": (0.0, 0.889, -0.129),
+    "S4": (0.0, 0.849, -0.083),
+    "S5": (0.007, 0.839, -0.065),
+}
+
+# Inner-layer rest offset (m, mesh frame). S4's skin layer sits at a constant offset from all of its inner meshes (muscle
+# and bone layers, muscle meshes, skel_mesh): the head vertices, which the skin and muscle layers share in the other
+# subjects, differ by exactly this (sd < 1e-6). The skin carries the markers, so the inner meshes are moved onto it.
+LAYER_REST_OFFSET = {
+    "S4": (0.002098, 0.014745, 0.010864),
+}
  
 # --- LOSS WEIGHT PRESETS ---
 # Add new presets here. Change ACTIVE_PRESET to switch between them.
@@ -912,6 +1046,18 @@ CONFIG = {
 #       w_tangent_musc/skin, w_vol_musc/skin
 
 LAMBDAS_PRESETS = {
+    # SOMA final (K1_rigid, 2026-10-07): posed data loss at real scale (k=1), static removal, rigid correction, rig v3.
+    # w_data is high because the target is in metres at scale 1 (vs the x0.1 of the paper presets)
+    "soma_final": {
+        "w_data": 50000,
+        "w_smooth_musc": 100,       "w_smooth_skin": 200,
+        "w_biharmonic_musc": 100,   "w_biharmonic_skin": 200,
+        "w_spring_musc": 10000,     "w_spring_skin": 10000,
+        "w_tangent_musc": 1,        "w_tangent_skin": 0.1,
+        "w_vol_musc": 30,           "w_vol_skin": 30,
+        "w_crease_musc": 75,        "w_crease_skin": 75,
+        "w_unobs": 10000,  # 2026-10-11 (U_unobsN1e4): with --unobs-normal and --drop-isolated (both default on)
+    },
     # All losses enabled at high weights
     "full": {
         "w_data": 50,
@@ -920,6 +1066,24 @@ LAMBDAS_PRESETS = {
         "w_spring_musc": 1000,      "w_spring_skin": 1000,
         "w_tangent_musc": 1,        "w_tangent_skin": 0.1,
         "w_vol_musc": 1000,         "w_vol_skin": 1000,
+    },
+    # Paper final (MLP, as in the paper): full but vol 10/10
+    "paper_final": {
+        "w_data": 50,
+        "w_smooth_musc": 100,       "w_smooth_skin": 200,
+        "w_biharmonic_musc": 100,   "w_biharmonic_skin": 200,
+        "w_spring_musc": 1000,      "w_spring_skin": 1000,
+        "w_tangent_musc": 1,        "w_tangent_skin": 0.1,
+        "w_vol_musc": 10,           "w_vol_skin": 10,
+    },
+    # Sanity: data term only, no regularization (upper bound on marker fit)
+    "data_only": {
+        "w_data": 1,
+        "w_smooth_musc": 0,         "w_smooth_skin": 0,
+        "w_biharmonic_musc": 0,     "w_biharmonic_skin": 0,
+        "w_spring_musc": 0,         "w_spring_skin": 0,
+        "w_tangent_musc": 0,        "w_tangent_skin": 0,
+        "w_vol_musc": 0,            "w_vol_skin": 0,
     },
     # Ablation: remove vector losses (E_smooth, E_tan)
     "no_smooth_tan": {
@@ -960,19 +1124,148 @@ LAMBDAS_PRESETS = {
 }
 
 # ------------------------------------------------------------------
-ACTIVE_PRESET = "no_bi_stretch"  # <-- Change this to switch presets
+ACTIVE_PRESET = "soma_final"  # <-- Change this to switch presets
 LAMBDAS = LAMBDAS_PRESETS[ACTIVE_PRESET]
 # ------------------------------------------------------------------
 
 # --- PATH SETUP ---
-# Adjust this base path to match new directory structure
-BASE_DIR = rf"/CT/SOMA/{CONFIG['base_path_suffix']}/{CONFIG['subject']}"
+# All inputs come from the SKIM dataset root: --data-root, else the SKIM_ROOT env var.
+_parser = argparse.ArgumentParser()
+_parser.add_argument("--data-root", default=os.environ.get("SKIM_ROOT"),
+                     help="SKIM dataset root (default: $SKIM_ROOT)")
+# Optional overrides (for sweeps); unset = keep the values in CONFIG / ACTIVE_PRESET above
+_parser.add_argument("--subject")
+_parser.add_argument("--arch", choices=["linear", "mlp", "unet"])
+_parser.add_argument("--preset", choices=list(LAMBDAS_PRESETS))
+_parser.add_argument("--epochs", type=int)
+_parser.add_argument("--lr", type=float)
+_parser.add_argument("--w", action="append", default=[], metavar="KEY=VAL",
+                     help="Override one loss weight, e.g. --w w_vol_musc=10 (repeatable)")
+_parser.add_argument("--data-norm", choices=["all", "visible"], default="visible",
+                     help="Data loss: 'all' = mean over all markers (original); 'visible' = mean over visible "
+                          "markers, centroids from visible markers only")
+_parser.add_argument("--marker-offset", action=argparse.BooleanOptionalAction, default=True,
+                     help="Shift predicted markers by a constant so zero displacement == LBS (p_bind)")
+_parser.add_argument("--transpose-rot", action="store_true",
+                     help="Legacy: transpose rotation matrices (old training behaviour; wrong convention)")
+_parser.add_argument("--rigid-bone", action=argparse.BooleanOptionalAction, default=True,
+                     help="Skin the bone layer rigidly (one-hot on the dominant joint), as 03 evaluates it")
+_parser.add_argument("--vol-loss", choices=["energy", "rel"], default="rel",
+                     help="Prism volume loss: 'energy' = (V-V0)^2/|V0| (original); 'rel' = ((V-V0)/|V0|)^2")
+_parser.add_argument("--fat-posed", action=argparse.BooleanOptionalAction, default=True,
+                     help="Fat (muscle->skin) volume loss in posed space instead of the canonical T-pose")
+_parser.add_argument("--legacy-laplacian", action="store_true",
+                     help="Legacy: use trimesh's averaging operator A instead of the Laplacian I - A in the smoothness losses")
+_parser.add_argument("--fat-patch-radius", type=float, default=0.0,
+                     help="Fat volume loss per geodesic patch of this radius (m) instead of per prism (0 = per prism)")
+_parser.add_argument("--musc-patches", action="store_true",
+                     help="Muscle volume loss per individual-muscle footprint instead of per prism")
+_parser.add_argument("--residual-scale", type=float, default=1.0,
+                     help="Training target = (observed - LBS) * this (metres). The stored residuals use 0.1 (historical shrink)")
+_parser.add_argument("--residual-static-removal", action=argparse.BooleanOptionalAction, default=True,
+                     help="Subtract each marker's mean training residual from the targets (keep only the pose-dependent part)")
+_parser.add_argument("--crease-mode", choices=["lbs", "onesided"], default="onesided",
+                     help="Crease loss: 'lbs' = dihedral change vs posed LBS; 'onesided' = only creasing beyond LBS (vs rest)")
+_parser.add_argument("--posed-frame", action="store_true",
+                     help="Apply the correctives in each vertex's posed frame (blended rotation) instead of through the LBS matrix")
+_parser.add_argument("--posed-data", action=argparse.BooleanOptionalAction, default=True,
+                     help="Data loss in posed space: posed marker shift (SOMA - LBS) vs the residual rotated into the "
+                          "model frame (stored residuals are posed world Z-up; the default T-pose loss adds them unrotated). "
+                          "Static removal is then done in each marker's bone frame. The per-shot global_R is undone at load")
+_parser.add_argument("--rigid-correction", action=argparse.BooleanOptionalAction, default=True,
+                     help="Pose-conditioned per-joint rigid skeleton correction inside LBS (all layers follow; no tissue "
+                          "physics on it). Needs --posed-data. Prior weight: --w w_rigid=X (default 1)")
+_parser.add_argument("--rig", default="auto",
+                     help="Rebuilt rig from build_rig.py (rest joints refitted to the bones + bone-heat skin weights). "
+                          "'auto' = <root>/<S>/canonical_model/<S>_rig.npz on SKIM V2, else rigs/<S>_rig.npz; "
+                          "'none' = the original Captury rig and weights")
+_parser.add_argument("--drop-isolated", action=argparse.BooleanOptionalAction, default=True,
+                     help="Drop observed markers with fewer than 2 of their 8 nearest markers observed in that frame "
+                          "(edge-of-patch outliers: ~3x jitter, ~4x residual)")
+_parser.add_argument("--drop-inconsistent", type=float, default=0.05,
+                     help="Drop (training) observed markers whose residual differs from the median residual of their "
+                          "observed 8-nearest markers by more than this (real m); needs >= 3 observed neighbours. "
+                          "0 = off. S5 has marker groups that disagree with their neighbours (skin peaks; 2026-10-12 "
+                          "DI_5cm: ~3%% of S5 observations dropped)")
+_parser.add_argument("--unobs-normal", action=argparse.BooleanOptionalAction, default=True,
+                     help="w_unobs penalises only the skin displacement along the rest normal, so hidden skin can still "
+                          "slide tangentially with its observed neighbours (muscle term unchanged)")
+_parser.add_argument("--forearm-detwist", action=argparse.BooleanOptionalAction, default=None,
+                     help="Remove the BVH ForeArm twist (about the bone axis) and convert the targets: the raw Captury BVHs "
+                          "put a large roll there that neither the observed forearm nor the hand follows. "
+                          "Default: on for S2-S5 (raw Captury), off for S1 (re-exported BVH). Needs --rig")
+_parser.add_argument("--tag", help="Run name suffix (replaces the preset name in checkpoint/run names)")
+_parser.add_argument("--seed", type=int, default=0,
+                     help="Seeds python/numpy/torch (init, shuffling, dropout); runs are repeatable up to GPU non-determinism")
+_args = _parser.parse_args()
+random.seed(_args.seed); np.random.seed(_args.seed); torch.manual_seed(_args.seed)  # torch.manual_seed also seeds CUDA
+DATA_ROOT = _args.data_root
+if _args.subject: CONFIG["subject"] = _args.subject
+if _args.arch: CONFIG["architecture"] = _args.arch
+if _args.epochs: CONFIG["epochs"] = _args.epochs
+if _args.lr: CONFIG["learning_rate"] = _args.lr
+if _args.preset:
+    ACTIVE_PRESET = _args.preset
+    LAMBDAS = LAMBDAS_PRESETS[ACTIVE_PRESET]
+LAMBDAS = dict(LAMBDAS)
+LAMBDAS.setdefault("w_inv_skin", 0.0)  # inverted-prism penalties (pair with the patch volume losses)
+LAMBDAS.setdefault("w_inv_musc", 0.0)
+LAMBDAS.setdefault("w_crease_skin", 0.0)  # posed crease loss (dihedral change vs posed LBS)
+LAMBDAS.setdefault("w_crease_musc", 0.0)
+LAMBDAS.setdefault("w_rigid", 1.0)  # rigid correction magnitude prior (mean squared raw head output); only with --rigid-correction
+LAMBDAS.setdefault("w_unobs", 0.0)  # |d|^2 prior (pull to LBS) on skin vertices whose nearest markers are unobserved in that frame
+for _kv in _args.w:
+    _k, _v = _kv.split("=")
+    if _k not in LAMBDAS: _parser.error(f"unknown loss weight {_k}")
+    LAMBDAS[_k] = float(_v)
+DATA_NORM = _args.data_norm
+MARKER_OFFSET = _args.marker_offset
+TRANSPOSE_ROT = _args.transpose_rot
+RIGID_BONE = _args.rigid_bone
+VOL_LOSS = _args.vol_loss
+FAT_POSED = _args.fat_posed
+LEGACY_LAPLACIAN = _args.legacy_laplacian
+FAT_PATCH_RADIUS = _args.fat_patch_radius
+MUSC_PATCHES = _args.musc_patches
+POSED_FRAME = _args.posed_frame
+POSED_DATA = _args.posed_data
+RIGID_CORRECTION = _args.rigid_correction
+DROP_ISOLATED = _args.drop_isolated
+DROP_INCONSISTENT = _args.drop_inconsistent
+UNOBS_NORMAL = _args.unobs_normal
+FOREARM_DETWIST = _args.forearm_detwist if _args.forearm_detwist is not None else CONFIG["subject"] != "S1"
+RIG_PATH = {"auto": os.path.join("rigs", f"{CONFIG['subject']}_rig.npz"), "none": None}.get(_args.rig, _args.rig)
+if RIGID_CORRECTION and not POSED_DATA:
+    _parser.error("--rigid-correction needs --posed-data (the skeleton correction only shows in posed space)")
+if RIGID_CORRECTION and POSED_FRAME:
+    _parser.error("--rigid-correction does not support --posed-frame")
+if POSED_DATA and TRANSPOSE_ROT:
+    _parser.error("--posed-data does not support --transpose-rot")
+CREASE_MODE = _args.crease_mode
+RESIDUAL_SCALE = _args.residual_scale
+RESIDUAL_STATIC_REMOVAL = _args.residual_static_removal
+RUN_TAG = _args.tag or ACTIVE_PRESET
+if not DATA_ROOT:
+    _parser.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
+# SKIM V2 (build_skim_v2.py) has the rig, forearm de-twist and S4 layer offset baked in: no load-time conversion
+_meta = os.path.join(DATA_ROOT, "metadata.json")
+SKIM_VERSION = json.load(open(_meta)).get("dataset_version", 1) if os.path.exists(_meta) else 1
+if SKIM_VERSION >= 2:
+    if not RIG_PATH:
+        _parser.error("SKIM V2 residuals are referenced to the rebuilt rig: --rig none is not supported")
+    if _args.rig == "auto":  # the rig shipped with the dataset
+        RIG_PATH = os.path.join(DATA_ROOT, CONFIG['subject'], "canonical_model", f"{CONFIG['subject']}_rig.npz")
+    FOREARM_DETWIST = False  # poses already de-twisted
+    LAYER_REST_OFFSET = {}
+if RIG_PATH and not os.path.exists(RIG_PATH):
+    _parser.error(f"rig {RIG_PATH} not found: run build_rig.py --subject {CONFIG['subject']}, or pass --rig none")
+if FOREARM_DETWIST and not (RIG_PATH and POSED_DATA):
+    _parser.error("--forearm-detwist needs --rig and --posed-data (the targets are converted with the original-rig LBS)")
+BASE_DIR = os.path.join(DATA_ROOT, CONFIG['subject'])
 
-# The packed training frames live in the self-contained SKIM dataset under static00; the raw/layers/
-# canonical inputs still read from BASE_DIR. Built by 05-Training/{preprocess_from_skim,pack_preprocessed}.py
-# from the pure-Python SKIM residual dataset (/CT/SOMA/static00/SKIM_dataset/<S>/shot_*.npz). The loader
-# (ProcessedMotionDataset) auto-detects the packed <shot>.npz layout.
-PROCESSED_ROOT = rf"/CT/SOMA/static00/SKIM_dataset/{CONFIG['subject']}/preprocessed_vFinal_clean"
+# Packed training frames (one <shot>.npz per shot), built by 05-Training/{preprocess_from_skim,pack_preprocessed}.py
+# from the SKIM residuals (<root>/<S>/shot_*.npz). The loader (ProcessedMotionDataset) auto-detects the packed layout.
+PROCESSED_ROOT = os.path.join(BASE_DIR, "preprocessed_vFinal_clean")
 
 PATHS = {
     "raw": os.path.join(BASE_DIR, "raw"),
@@ -1008,7 +1301,12 @@ class ProcessedMotionDataset(Dataset):
                 shot = os.path.basename(p)[:-4]
                 d = np.load(p)
                 poses.append(d["pose"].astype(np.float32))
-                res.append(d["residuals"].astype(np.float32))
+                # residual = obs - (global_R @ LBS + global_t): undo the per-shot alignment, r <- global_R^T r (row vectors: r @ global_R)
+                if "global_R" in d.files:
+                    res.append(d["residuals"].astype(np.float32) @ d["global_R"].astype(np.float32))
+                else:
+                    logger.warning(f"[DATA] {shot}: no global_R in the packed npz, residuals left in the aligned world frame")
+                    res.append(d["residuals"].astype(np.float32))
                 masks.append(d["masks"].astype(np.float32))
                 ids += [f"{shot}_frame_{i:04d}" for i in range(d["pose"].shape[0])]
             self._pose = np.concatenate(poses, 0)
@@ -1363,6 +1661,41 @@ class MuscleUNetModel(nn.Module):
 
         return disp_muscle, disp_skin
 
+# Joints the rigid correction leaves at identity (no markers / not of interest); they follow their parent
+RIGID_FREE_JOINTS = ("Neck", "Head", "LeftHand", "RightHand", "LeftFoot", "RightFoot", "LeftToeBase", "RightToeBase")
+
+def axis_angle_to_rotmat(aa):
+    """Rodrigues, (...,3) -> (...,3,3); smooth at zero."""
+    theta2 = aa.pow(2).sum(-1, keepdim=True).unsqueeze(-1)
+    theta = (theta2 + 1e-12).sqrt()
+    x, y, z = aa.unbind(-1)
+    zero = torch.zeros_like(x)
+    A = torch.stack([zero, -z, y, z, zero, -x, -y, x, zero], -1).view(*aa.shape[:-1], 3, 3)
+    eye = torch.eye(3, device=aa.device, dtype=aa.dtype).expand_as(A)
+    return eye + torch.sin(theta) / theta * A + (1 - torch.cos(theta)) / (theta2 + 1e-12) * (A @ A)
+
+class RigidCorrectionHead(nn.Module):
+    """Pose-conditioned rigid correction per joint (skeleton error: joint placement / bone orientation), applied
+    inside LBS so all layers follow it rigidly. Output (B,J,4,4); zero-initialised, so training starts at LBS.
+    Units: rotation 0.1 rad and translation 2 cm per unit of network output (raw output returned for the prior)."""
+    def __init__(self, num_joints, joint_mask, hidden_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(num_joints * 9, hidden_dim), nn.LeakyReLU(0.2),
+                                 nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(0.2),
+                                 nn.Linear(hidden_dim, num_joints * 6))
+        nn.init.zeros_(self.net[-1].weight)
+        nn.init.zeros_(self.net[-1].bias)
+        self.register_buffer('joint_mask', joint_mask)  # (J,6): 0 = component fixed
+
+    def forward(self, rot_mats):
+        B, J = rot_mats.shape[:2]
+        eye = torch.eye(3, device=rot_mats.device, dtype=rot_mats.dtype)
+        raw = self.net((rot_mats - eye).reshape(B, -1)).view(B, J, 6) * self.joint_mask
+        C = torch.eye(4, device=rot_mats.device, dtype=rot_mats.dtype).repeat(B, J, 1, 1)
+        C[..., :3, :3] = axis_angle_to_rotmat(0.1 * raw[..., :3])
+        C[..., :3, 3] = 0.02 * raw[..., 3:]
+        return C, raw
+
 class SOMALossOriginal(nn.Module):
     def __init__(self, skin_geo, muscle_geo, bone_geo, lambdas):
         """
@@ -1447,7 +1780,8 @@ class SOMALossOriginal(nn.Module):
     def forward(self, 
                 pred_markers, gt_markers, mask, p_bind,     # Data Terms
                 s_final_theta, m_final_theta, b_final_theta,   # Geometry Terms
-                disp_skin, disp_musc):              # Displacement Terms (for smooth)
+                disp_skin, disp_musc,               # Displacement Terms (for smooth)
+                s_lbs_theta=None, m_lbs_theta=None):  # Posed LBS meshes (for the crease loss)
 
         losses = {}
 
@@ -1463,7 +1797,11 @@ class SOMALossOriginal(nn.Module):
         # A. DATA LOSS (Masked L2 Distance)
         # ==========================================================
         error = (pred_markers - p_gt) * mask.unsqueeze(-1)
-        data_loss = error.pow(2).mean()
+        if DATA_NORM == "visible":
+            # Divide only by the number of active coordinates
+            data_loss = error.pow(2).sum() / (mask.sum() * 3.0 + 1e-8)
+        else:
+            data_loss = error.pow(2).mean()
         losses['data'] = data_loss
 
         # ---
@@ -1600,14 +1938,42 @@ class SOMALossOriginal(nn.Module):
         
         # 1. Skin-to-Muscle Volume (Evaluated in Canonical Space)
         # We use curr_m and curr_s (Canonical offset vertices calculated in stretch block)
-        loss_vol_skin = self.prism_calculator(curr_m, curr_s, self.rest_vol_skin, self.skin['faces'])
+        fat_inner, fat_outer = (m_final_theta, s_final_theta) if FAT_POSED else (curr_m, curr_s)
+        loss_vol_skin = self.prism_calculator(fat_inner, fat_outer, self.rest_vol_skin, self.skin['faces'], self.skin.get('vol_patch'))
 
         # 2. Muscle-to-Bone Volume (Evaluated in POSED Space!)
         # We use b_final_theta and m_final_theta (The crushed LBS vertices)
-        loss_vol_musc = self.prism_calculator(b_final_theta, m_final_theta, self.rest_vol_musc, self.muscle['faces'])
+        loss_vol_musc = self.prism_calculator(b_final_theta, m_final_theta, self.rest_vol_musc, self.muscle['faces'], self.muscle.get('vol_patch'))
 
         losses['vol_skin'] = loss_vol_skin
         losses['vol_musc'] = loss_vol_musc
+        losses['inv_skin'] = self.prism_calculator.inversion(fat_inner, fat_outer, self.rest_vol_skin, self.skin['faces'])
+        losses['inv_musc'] = self.prism_calculator.inversion(b_final_theta, m_final_theta, self.rest_vol_musc, self.muscle['faces'])
+
+        # ==========================================================
+        # G. POSED CREASE LOSS
+        # ==========================================================
+        # Squared change of the posed dihedral angles w.r.t. the posed LBS mesh: penalises only the creases the
+        # correctives add (LBS's own folds are free). Body face pairs only (hands have zero LBS weights).
+        def dihedral(verts, faces, pairs):
+            v0, v1, v2 = verts[:, faces[:, 0]], verts[:, faces[:, 1]], verts[:, faces[:, 2]]
+            n = torch.cross(v1 - v0, v2 - v0, dim=-1)
+            n = n / (n.norm(dim=-1, keepdim=True) + 1e-12)
+            a, b = n[:, pairs[:, 0]], n[:, pairs[:, 1]]
+            s = torch.cross(a, b, dim=-1).pow(2).sum(-1).add(1e-12).sqrt()
+            return torch.atan2(s, (a * b).sum(-1))  # stable near flat, unlike acos / cosine differences
+
+        if s_lbs_theta is not None and 'crease_pairs' in self.skin:
+            for key, verts, lbs, geo in [('crease_skin', s_final_theta, s_lbs_theta, self.skin),
+                                         ('crease_musc', m_final_theta, m_lbs_theta, self.muscle)]:
+                ang, ang_lbs = dihedral(verts, geo['faces'], geo['crease_pairs']), dihedral(lbs, geo['faces'], geo['crease_pairs']).detach()
+                if CREASE_MODE == "onesided":
+                    # Only creasing beyond LBS (w.r.t. the rest mesh) costs: undoing LBS's own collapse is free
+                    rest = dihedral(geo['verts'].unsqueeze(0), geo['faces'], geo['crease_pairs']).detach()
+                    d = torch.relu((ang - rest).abs() - (ang_lbs - rest).abs())
+                else:
+                    d = ang - ang_lbs
+                losses[key] = d.pow(2).mean()
 
         # ==========================================================
 
@@ -1622,7 +1988,11 @@ class SOMALossOriginal(nn.Module):
             self.lambdas.get('w_tangent_musc', 0.0) * losses['tangent_musc'] +
             self.lambdas.get('w_tangent_skin', 0.0) * losses['tangent_skin'] +
             self.lambdas.get('w_vol_skin', 0.0) * losses['vol_skin'] +
-            self.lambdas.get('w_vol_musc', 0.0) * losses['vol_musc']
+            self.lambdas.get('w_vol_musc', 0.0) * losses['vol_musc'] +
+            self.lambdas.get('w_inv_skin', 0.0) * losses['inv_skin'] +
+            self.lambdas.get('w_inv_musc', 0.0) * losses['inv_musc'] +
+            self.lambdas.get('w_crease_skin', 0.0) * losses.get('crease_skin', 0.0) +
+            self.lambdas.get('w_crease_musc', 0.0) * losses.get('crease_musc', 0.0)
         )
         
         return total_loss, losses
@@ -1659,7 +2029,9 @@ class SOMAModel(nn.Module):
                  active_muscle_mask=None,
                  target_marker_mask=None,
                  stability_mask=None,
-                 architecture = "mlp"):
+                 architecture = "mlp",
+                 joint_names=None,
+                 rig_old=None):
         """
         Args:
             ---- MESH GEOMETRY ----
@@ -1750,7 +2122,11 @@ class SOMAModel(nn.Module):
         self.register_buffer('p_bind', p_bind)
         self.register_buffer('bary_verts', bary_verts)
         self.register_buffer('bary_weights', bary_weights)
-        
+        # Constant per-marker offset added to the predicted markers (0 unless calibrate_marker_offset is called)
+        self.register_buffer('marker_offset', torch.zeros_like(p_bind))
+        # Per-marker LBS weights (skin weights interpolated over the marker's triangle), for --posed-data
+        self.register_buffer('marker_weights', (bary_weights.unsqueeze(-1) * skin_weights[bary_verts]).sum(1))
+
         # ========================================================================================
         # 6. OPTIONAL MASKS
         # ========================================================================================
@@ -1794,9 +2170,50 @@ class SOMAModel(nn.Module):
         else:
             raise ValueError(f"Unknown architecture: {architecture}")
 
+        # Rebuilt rig (--rig): the residuals were measured against the ORIGINAL marker LBS (canonical.npz W, Captury
+        # joints); rig_marker_delta() converts them to the new rig. rig_old = (W_old (M,J), j_rest_old (J,3)).
+        self.rig_old = rig_old is not None
+        if self.rig_old:
+            self.register_buffer('marker_W_old', rig_old[0])
+            self.register_buffer('j_rest_old', rig_old[1])
+
+        self.rigid_head = None
+        if RIGID_CORRECTION:
+            joint_mask = torch.ones(len(joint_names), 6)
+            for i, n in enumerate(joint_names):
+                if n in RIGID_FREE_JOINTS:
+                    joint_mask[i] = 0.0
+            joint_mask[0, 3:] = 0.0  # root translation: removed by the per-frame marker centring anyway
+            self.rigid_head = RigidCorrectionHead(len(joint_names), joint_mask.to(self.j_rest.device))
+            logger.info(f"[MODEL] Rigid correction head on {int((joint_mask[:, 0] > 0).sum())} joints (fixed: {', '.join(RIGID_FREE_JOINTS)})")
+
         logger.debug(f"[MODEL] SOMAModel initialized with {self.m_bind.shape[0]} vertices and {self.j_rest.shape[0]} joints")
         logger.debug(f"[MODEL] Markers: {self.p_bind.shape[0]}, LBS Joints: {self.skin_weights.shape[1]}")
     
+    def calibrate_marker_offset(self, rot_identity):
+        """Set marker_offset so that zero displacement reproduces p_bind exactly. The residuals are
+        defined against marker-LBS from p_bind, while the model reads markers barycentrically off the
+        skin; without this, SOMA starts from a constant offset instead of from LBS."""
+        with torch.no_grad():
+            zero_root = torch.zeros(1, 3, device=self.s_bind.device, dtype=self.s_bind.dtype)
+            s_tpose = lbs_working_batch_rotmat(self.s_bind.unsqueeze(0), rot_identity, self.skin_weights, self.j_rest, self.parents, zero_root)
+            p_skin = barycentric_interpolation_batch(s_tpose, self.bary_verts, self.bary_weights)[0] + self.j_rest[0]
+            self.marker_offset = self.p_bind - p_skin
+        return self.marker_offset.norm(dim=-1)
+
+    def rig_marker_delta(self, rot_mats):
+        """(B,M,3) posed marker LBS of the original rig minus the new rig (m, model frame, root at 0)."""
+        B = rot_mats.shape[0]
+        zero = torch.zeros(B, 3, device=rot_mats.device, dtype=self.p_bind.dtype)
+        P = self.p_bind.unsqueeze(0).expand(B, -1, -1)
+        old = lbs_working_batch_rotmat(P, rot_mats, self.marker_W_old, self.j_rest_old, self.parents, zero)
+        new = lbs_working_batch_rotmat(P, rot_mats, self.marker_weights, self.j_rest, self.parents, zero)
+        return old - new
+
+    def marker_rotations(self, rot_mats):
+        """(B,M,3,3) linear blend of the joint rotations at each marker: how LBS maps a canonical offset there."""
+        return torch.einsum('mj,bjxy->bmxy', self.marker_weights, global_rotations(rot_mats, self.parents))
+
     def forward(self, rot_input, rot_identity_input, root_positions=None):
         # Normalize to rotation matrices
         if rot_input.dim() == 4 and rot_input.shape[-2:] == (3, 3):
@@ -1809,8 +2226,10 @@ class SOMAModel(nn.Module):
         else:
             raise ValueError(f"Unsupported rot_input shape {rot_input.shape}")
 
-        # FIX: Ensure rotation matrices match debug convention ---
-        rot_mats = rot_mats.transpose(-2, -1)
+        # Rotation matrices are used as-is: the 6D data stores [col0|col1] of R, sixd_to_rotmat stacks
+        # columns and LBS uses column vectors. (A transpose here used to feed inverse rotations; 02/03 never had it.)
+        if TRANSPOSE_ROT:
+            rot_mats = rot_mats.transpose(-2, -1)
 
         batch_size = rot_mats.shape[0]
 
@@ -1860,13 +2279,24 @@ class SOMAModel(nn.Module):
         # 7. Deform skin and apply LBS
         s_final = self.s_bind.unsqueeze(0) + d_skin
 
-        # 8. LBS on skin (optimized) and muscle (optimized)
-        m_final_theta = lbs_working_batch_rotmat(m_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions)
-        s_final_theta = lbs_working_batch_rotmat(s_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions)
+        # 8. LBS on skin (optimized) and muscle (optimized); with --rigid-correction all posed layers use the corrected skeleton
+        corr, rigid_raw = self.rigid_head(rot_mats) if self.rigid_head is not None else (None, None)
+        if POSED_FRAME:
+            # Corrective applied in each vertex's posed frame (blended rotation) on top of the LBS rest mesh
+            m_final_theta = lbs_working_batch_rotmat(self.m_bind.unsqueeze(0).expand(batch_size, -1, -1), rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions) \
+                + blended_vertex_rotate(d_muscle.expand(batch_size, -1, -1), rot_mats, self.skin_weights, self.parents)
+            s_final_theta = lbs_working_batch_rotmat(self.s_bind.unsqueeze(0).expand(batch_size, -1, -1), rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions) \
+                + blended_vertex_rotate(d_skin.expand(batch_size, -1, -1), rot_mats, self.skin_weights, self.parents)
+        else:
+            m_final_theta = lbs_working_batch_rotmat(m_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions, corr)
+            s_final_theta = lbs_working_batch_rotmat(s_final, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions, corr)
 
         # (Assuming self.b_bind and self.bone_weights exist)
         b_bind_batch = self.b_bind.unsqueeze(0).expand(batch_size, -1, -1)
-        b_final_theta = lbs_working_batch_rotmat(b_bind_batch, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions)
+        bone_weights = self.skin_weights
+        if RIGID_BONE and not RIG_PATH:  # one-hot on the dominant joint, as 03 evaluates it (--rig: shared smooth weights)
+            bone_weights = torch.zeros_like(self.skin_weights).scatter_(1, self.skin_weights.argmax(dim=1, keepdim=True), 1.0)
+        b_final_theta = lbs_working_batch_rotmat(b_bind_batch, rot_mats, bone_weights, self.j_rest, self.parents, root_positions, corr)
 
         # 9. Barycentric interpolation to get predicted marker positions
         p_pred_theta = barycentric_interpolation_batch(s_final_theta, self.bary_verts, self.bary_weights)
@@ -1884,7 +2314,7 @@ class SOMAModel(nn.Module):
         zero_root = torch.zeros_like(root_positions)
         s_final_tpose = lbs_working_batch_rotmat(s_final, rot_identity_input, self.skin_weights, self.j_rest, self.parents, zero_root)
 
-        p_pred_tpose = barycentric_interpolation_batch(s_final_tpose, self.bary_verts, self.bary_weights)
+        p_pred_tpose = barycentric_interpolation_batch(s_final_tpose, self.bary_verts, self.bary_weights) + self.marker_offset
 
         return {
             # ---- DEFORMATIONS IN CANONICAL SPACE (T-POSE) ----
@@ -1915,8 +2345,24 @@ class SOMAModel(nn.Module):
             # ---- GEOMETRIC PROPERTIES ----
             'm_normals': self.m_normals,                # (V, 3) | Muscle vertex normals (normalized)
             's_normals': self.s_normals,                # (V, 3) | Skin vertex normals (normalized)
+
+            # ---- POSE ----
+            'marker_rot': self.marker_rotations(rot_mats) if POSED_DATA else None,  # (B, M, 3, 3) | LBS rotation per marker
+            'rig_delta': self.rig_marker_delta(rot_mats) if (POSED_DATA and self.rig_old) else None,  # (B, M, 3) m | old - new rig LBS
+
+            # ---- RIGID CORRECTION (--rigid-correction) ----
+            'rigid_raw': rigid_raw,                     # (B, J, 6) | raw head output (0.1 rad / 2 cm units), for the prior
+            # Corrected-skeleton LBS of the bind meshes: the crease reference (creasing beyond the corrected LBS)
+            's_rig_theta': lbs_working_batch_rotmat(s_bind_batch, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions, corr) if corr is not None else s_bind_theta,
+            'm_rig_theta': lbs_working_batch_rotmat(m_bind_batch, rot_mats, self.skin_weights, self.j_rest, self.parents, root_positions, corr) if corr is not None else m_bind_theta,
         }
 
+
+def save_soma_checkpoint(model, path):
+    """Deformation model state_dict at `path` (the format 02/03 load); the rigid head, if any, at <path>_rigid.pth."""
+    torch.save(model.deformation_model.state_dict(), path)
+    if model.rigid_head is not None:
+        torch.save(model.rigid_head.state_dict(), path.replace('.pth', '_rigid.pth'))
 
 # Main Training Script Structure
 def train_full_model():
@@ -2018,6 +2464,7 @@ def train_full_model():
         # Loading Individual Muscles Meshes
         try:
             single_m_vertex_np, single_m_face_np, single_l_muscle_sp, single_m_vertex_ranges, single_m_face_ranges = load_and_stack_muscles(muscle_obj_dir)
+            single_m_vertex_np = single_m_vertex_np + np.asarray(LAYER_REST_OFFSET.get(subject, (0.0, 0.0, 0.0)), dtype=single_m_vertex_np.dtype)
 
             # Create Tensors
             single_m_bind_vertices = torch.from_numpy(single_m_vertex_np).float()
@@ -2068,13 +2515,12 @@ def train_full_model():
         # ----------------
         # E. LBS 
 
-        skin_weights_npy_path = os.path.join(CANONICAL_DATA_DIRECTORY, f'lbs_skin/{subject}_skin_lbs_weights_exported.npy')
         skin_weights_json_path = os.path.join(CANONICAL_DATA_DIRECTORY, f'lbs_skin/{subject}_skin_lbs_weights_exported.json')
 
-        if not os.path.exists(skin_weights_npy_path):
-            raise FileNotFoundError(f"LBS Skin Weights file not found at {skin_weights_npy_path}")
+        if not os.path.exists(skin_weights_json_path):
+            raise FileNotFoundError(f"LBS Skin Weights file not found at {skin_weights_json_path}")
         else:
-            logger.debug(f"[LBS] LBS Skin Weights Path: {skin_weights_npy_path}")
+            logger.debug(f"[LBS] LBS Skin Weights Path: {skin_weights_json_path}")
             
         logger.success("[LBS] LBS Skin weight defined!")
         logger.info("============================================")
@@ -2170,17 +2616,27 @@ def train_full_model():
             val_dataset = Subset(full_dataset, val_indices)
         else:
             # 2. IF SPLIT DOES NOT EXIST: Create it and save it forever.
-            logger.warning(f"[DATA] No existing validation split found. Creating a new one...")
-            train_size = int(TRAIN_SIZE * len(full_dataset))
-            val_size = len(full_dataset) - train_size
-            
-            # Use a fixed generator seed for reproducibility just in case
-            generator = torch.Generator().manual_seed(42)
-            train_dataset_full, val_dataset = random_split(full_dataset, [train_size, val_size], generator=generator)
-            
-            validation_indices = val_dataset.indices
+            # Whole shots are held out (not random frames): neighbouring frames of one shot are
+            # near-identical, so a frame-level split would leak training data into validation.
+            logger.warning(f"[DATA] No existing validation split found. Creating a new shot-level one...")
+            shot_of = [os.path.basename(f).rsplit("_frame_", 1)[0] for f in all_files]
+            shots = sorted(set(shot_of))
+            order = torch.randperm(len(shots), generator=torch.Generator().manual_seed(42)).tolist()
+            target = (1.0 - TRAIN_SIZE) * len(all_files)
+            val_shots, n_val = set(), 0
+            for k in order:  # add a shot only if it brings the held-out size closer to the target
+                c = shot_of.count(shots[k])
+                if not val_shots or abs(n_val + c - target) < abs(n_val - target):
+                    val_shots.add(shots[k])
+                    n_val += c
+
+            validation_indices = [i for i, s in enumerate(shot_of) if s in val_shots]
+            train_indices = [i for i, s in enumerate(shot_of) if s not in val_shots]
+            train_dataset_full = Subset(full_dataset, train_indices)
+            val_dataset = Subset(full_dataset, validation_indices)
             validation_files = [all_files[i] for i in validation_indices]
-            
+            logger.info(f"[DATA] Held-out shots: {sorted(val_shots)} ({len(validation_indices)} / {len(all_files)} frames)")
+
             with open(val_json_path, "w") as f:
                 json.dump(validation_files, f, indent=4)
             logger.success(f"[DATA] Saved new validation split to {val_json_path}")
@@ -2191,6 +2647,23 @@ def train_full_model():
         # logger.success(f"[DATA] Saved {len(validation_files)} validation file paths to validation_filepaths.json")
 
         # val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+        # Static (pose-independent) per-marker residual, from the training frames only: marker placement and the
+        # canonical-mesh/LBS offset, not deformation. Subtracted from the targets with --residual-static-removal.
+        static_residual = None
+        if RESIDUAL_STATIC_REMOVAL and not POSED_DATA:  # --posed-data: computed in the bone frame once the model exists
+            if not full_dataset.packed:
+                raise ValueError("--residual-static-removal needs the packed dataset")
+            idx = np.asarray(train_indices)
+            acc, cnt = np.zeros(full_dataset._res.shape[1:], np.float64), np.zeros(full_dataset._res.shape[1], np.float64)
+            for k in range(0, len(idx), 2000):
+                r, m = full_dataset._res[idx[k:k + 2000]].astype(np.float64), full_dataset._mask[idx[k:k + 2000]].astype(np.float64)
+                acc += (r * m[..., None]).sum(0); cnt += m.sum(0)
+            static_np = (acc / np.maximum(cnt, 1)[:, None]).astype(np.float32)
+            os.makedirs(PATHS['checkpoints'], exist_ok=True)
+            np.save(os.path.join(PATHS['checkpoints'], f"{subject}_static_residual_{RUN_TAG}.npy"), static_np)
+            static_residual = torch.from_numpy(static_np).to(device)
+            logger.warning(f"[DATA] Static residual removed (stored units): median |r_static| {np.median(np.linalg.norm(static_np, axis=1)):.4f}")
+
         val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=CONFIG["num_workers"])
         
         logger.success(f"[DATA] Full training samples: {len(train_dataset_full)}, Validation samples: {len(val_dataset)}")
@@ -2225,7 +2698,7 @@ def train_full_model():
 
         arch_name = CONFIG["architecture"].upper()
 
-        MODEL = f"ABLATION_{arch_name}_{ACTIVE_PRESET}"
+        MODEL = f"{CONFIG['subject']}_ABLATION_{arch_name}_{RUN_TAG}"
 
         # --- NEW: Modify name if fine-tuning ---
         if CONFIG.get("checkpoint_path"):
@@ -2268,7 +2741,7 @@ def train_full_model():
             WEIGHT_DECAY = 0.0
         else:
             logger.warning("[WARNING] TRAINING FULL DATASET")
-            train_loader = DataLoader(train_dataset_full, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+            train_loader = DataLoader(train_dataset_full, batch_size=BATCH_SIZE, shuffle=True, num_workers=CONFIG["num_workers"])
             # val_loader already set above from random_split
 
         logger.success("[DATA] Datasets and dataloaders created successfully.")
@@ -2302,6 +2775,18 @@ def train_full_model():
 
         # Get the rest joint locations and convert to torch tensors
         j_rest_global, parents_global, offsets_global = get_rest_joint_locations(bvh_global, scale=SCALE) # Scale is always 1.0 / offset is NOT set to zero in the hips
+        if subject in HIPS_REST_OFFSET:
+            hips_offset = np.array(HIPS_REST_OFFSET[subject], dtype=j_rest_global.dtype)
+            j_rest_global = j_rest_global + hips_offset
+            offsets_global[0] = hips_offset
+            logger.warning(f"[BVH] Injected Hips rest offset {hips_offset} for {subject}")
+        if RIG_PATH:  # rebuilt rig (build_rig.py): rest joints refitted to the bones
+            _rig = np.load(RIG_PATH)
+            if [str(n) for n in _rig["joint_names"]] != list(joint_names_global):
+                raise ValueError(f"Rig {RIG_PATH} joint order does not match the BVH")
+            j_rest_global = _rig["j_rest"].astype(j_rest_global.dtype)
+            offsets_global = np.stack([j_rest_global[i] - (j_rest_global[p] if p >= 0 else 0) for i, p in enumerate(parents_global)])
+            logger.warning(f"[RIG] Rest joints from {RIG_PATH} (max move {np.abs(_rig['j_rest'] - _rig['j_rest_captury']).max() * 100:.1f} cm)")
         j_rest_tensor_global = torch.from_numpy(j_rest_global).float() # (24, 3)    <------------------------------------ TENSOR
         parents_tensor_global = torch.from_numpy(parents_global).long() # (24,)     <------------------------------------ TENSOR
         offsets_tensor_global = torch.from_numpy(offsets_global).float() # (24, 3)  <------------------------------------ TENSOR
@@ -2313,13 +2798,12 @@ def train_full_model():
 
         logger.info("[BVH] Determining skeleton structure from pre-processed data...")
 
-        # Get the first sample file to determine the pose vector size
-        sample_rot_path = glob.glob(os.path.join(PROCESSED_DATA_DIRECTORY, 'pose_rotations', '*.npy'))[0]
-        sample_rot_vector = np.load(sample_rot_path)
+        # Take the pose vector size from the first dataset frame (works for packed and per-frame layouts)
+        sample_rot_vector = full_dataset[0][0]
         
-        # Infer number of joints from the length of the pose vector directly from NPY file
+        # Infer number of joints from the length of the pose vector
         num_joints = len(sample_rot_vector) // 6 # 24 joints, 6 channels each (6D)
-        logger.success(f"[BVH] Inferred number of joints from .npy data: {num_joints}")
+        logger.success(f"[BVH] Inferred number of joints from processed data: {num_joints}")
 
         # Get rest joint locations and parents from BVH
         bvh_6d = BVH()
@@ -2368,6 +2852,7 @@ def train_full_model():
         try:
             logger.info("[MESH] Loading muscle layer...")
             musc_layer_vertices_np, musc_layer_faces_np = load_obj_simple(muscle_mesh_path)
+            musc_layer_vertices_np = musc_layer_vertices_np + np.asarray(LAYER_REST_OFFSET.get(subject, (0.0, 0.0, 0.0)), dtype=musc_layer_vertices_np.dtype)
             musc_layer = trimesh.Trimesh(vertices=musc_layer_vertices_np, faces=musc_layer_faces_np, process=False)
             
             if not isinstance(musc_layer, trimesh.Trimesh):
@@ -2386,6 +2871,7 @@ def train_full_model():
 
             logger.info("[MESH] Loading bone layer...")
             bone_layer_vertices_np, bone_layer_faces_np = load_obj_simple(bone_mesh_path)
+            bone_layer_vertices_np = bone_layer_vertices_np + np.asarray(LAYER_REST_OFFSET.get(subject, (0.0, 0.0, 0.0)), dtype=bone_layer_vertices_np.dtype)
             bone_layer = trimesh.Trimesh(vertices=bone_layer_vertices_np, faces=bone_layer_faces_np, process=False)
 
             if not isinstance(bone_layer, trimesh.Trimesh):
@@ -2508,7 +2994,10 @@ def train_full_model():
 
             logger.info("[LBS] Loading weights and skeleton info...")
 
-            weights_data = convert_weights_to_npy(skin_weights_json_path, len(s_bind_vertices), skin_weights_npy_path, joint_names_global, is_skin=True)
+            weights_data = convert_weights_to_npy(skin_weights_json_path, len(s_bind_vertices), joint_names_global, is_skin=True)
+            if RIG_PATH:
+                weights_data = _rig["weights"].astype(np.float32)
+                logger.warning(f"[RIG] Skin weights from {RIG_PATH} (bone heat)")
             skin_weights_tensor = torch.from_numpy(weights_data).float() #  <------------------------------------ TENSOR
 
             logger.success(f"[LBS] Loaded skin_weights matrix with shape: {skin_weights_tensor.shape}")  # (23752, 24)
@@ -2706,6 +3195,15 @@ def train_full_model():
             stability_mask = compute_vertex_stability_mask(m_bind, s_bind, m_faces)
             logger.success(f"[MESH] Stability Mask created. Pinned {int((1-stability_mask).sum())} vertices.")
 
+            rig_old = None
+            if RIG_PATH and SKIM_VERSION < 2:
+                if not POSED_DATA:
+                    raise ValueError("--rig needs --posed-data (the targets are converted to the new rig in posed space)")
+                _canon = np.load(os.path.join(BASE_DIR, "canonical.npz"))
+                if list(_canon["marker_ids"]) != list(bary_marker_ids):
+                    raise ValueError("canonical.npz marker order differs from the barycentric map")
+                rig_old = (torch.from_numpy(_canon["W"]).float().to(device), torch.from_numpy(_rig["j_rest_captury"]).float().to(device))
+
             # Instantiate the SOMAModel with all required tensors
             # Note: SOMAModel constructor expects all tensors already on device
             model = SOMAModel(
@@ -2747,7 +3245,9 @@ def train_full_model():
                 active_muscle_mask=active_muscle_mask,
                 target_marker_mask=target_marker_mask,
                 stability_mask=stability_mask,
-                architecture=CONFIG["architecture"]
+                architecture=CONFIG["architecture"],
+                joint_names=joint_names_global,
+                rig_old=rig_old
             )
 
             logger.success(f"[MODEL] SOMAModel instantiated successfully.")
@@ -2755,6 +3255,68 @@ def train_full_model():
 
             model = model.to(device)
             logger.success(f"[MODEL] Model moved to device: {device}")
+
+            if MARKER_OFFSET:
+                _eye = torch.eye(3, device=device).view(1, 1, 3, 3).repeat(1, model.j_rest.shape[0], 1, 1)
+                _off = model.calibrate_marker_offset(_eye)
+                logger.warning(f"[MODEL] --marker-offset: markers shifted onto p_bind (mean {_off.mean().item():.5f}, max {_off.max().item():.5f}, >2cm: {int((_off > 0.02).sum())}, worst idx: {_off.topk(5).indices.tolist()} {[round(v, 3) for v in _off.topk(5).values.tolist()]}).")
+
+            if FOREARM_DETWIST:
+                # In place on the RAM dataset, before anything reads it: de-twisted poses (network input and every LBS),
+                # residuals re-referenced to the original-rig marker LBS of the de-twisted pose, so that rig_marker_delta
+                # completes obs - LBS_new(theta_dt). Stored units (x0.1), aligned world frame: r += 0.1 * d @ RESIDUAL_TO_MODEL.
+                if not full_dataset.packed:
+                    raise ValueError("--forearm-detwist needs the packed dataset")
+                _tw = []
+                with torch.no_grad():
+                    for k in range(0, len(full_dataset._pose), 1000):
+                        sl = slice(k, k + 1000)
+                        rot = sixd_to_rotmat(torch.from_numpy(full_dataset._pose[sl]).to(device).view(-1, model.j_rest.shape[0], 6))
+                        rot_dt = detwist(rot, model.j_rest, joint_names_global, parents)
+                        P, zero = model.p_bind.unsqueeze(0).expand(len(rot), -1, -1), torch.zeros(len(rot), 3, device=device)
+                        d = (lbs_working_batch_rotmat(P, rot, model.marker_W_old, model.j_rest_old, model.parents, zero)
+                             - lbs_working_batch_rotmat(P, rot_dt, model.marker_W_old, model.j_rest_old, model.parents, zero))
+                        full_dataset._res[sl] += (0.1 * d @ RESIDUAL_TO_MODEL.to(device)).cpu().numpy()
+                        full_dataset._pose[sl] = rotmat_to_sixd(rot_dt).reshape(len(rot), -1).cpu().numpy()
+                        _tw.append(d.norm(dim=-1).mean().item())
+                logger.warning(f"[DATA] --forearm-detwist: ForeArm twist removed; targets shifted by {np.mean(_tw) * 1000:.1f} mm on average (all markers)")
+
+            static_canon = None
+            if RESIDUAL_STATIC_REMOVAL and POSED_DATA:
+                # Static residual as a constant offset c_m in each marker's bone frame: least squares over the training
+                # frames of R_m(theta) c_m = r (r rotated into the model frame). Subtracted posed, as R_m(theta) c_m.
+                if not full_dataset.packed:
+                    raise ValueError("--residual-static-removal needs the packed dataset")
+                idx = np.asarray(train_indices)
+                M_ = full_dataset._res.shape[1]
+                AtA = torch.zeros(M_, 3, 3, device=device, dtype=torch.float64)
+                Atb = torch.zeros(M_, 3, device=device, dtype=torch.float64)
+                with torch.no_grad():
+                    for k in range(0, len(idx), 1000):
+                        sl = idx[k:k + 1000]
+                        rot = sixd_to_rotmat(torch.from_numpy(full_dataset._pose[sl]).to(device).view(len(sl), -1, 6))
+                        A = model.marker_rotations(rot).double()                                       # (B,M,3,3)
+                        r = torch.from_numpy(full_dataset._res[sl]).to(device).double() @ RESIDUAL_TO_MODEL.to(device).double().T
+                        if model.rig_old:
+                            r = r + 0.1 * model.rig_marker_delta(rot).double()
+                        m = torch.from_numpy(full_dataset._mask[sl]).to(device).double()[..., None, None]
+                        AtA += (A.transpose(-1, -2) @ A * m).sum(0)
+                        Atb += ((A.transpose(-1, -2) @ r.unsqueeze(-1)).squeeze(-1) * m[..., 0]).sum(0)
+                AtA += 1e-6 * torch.eye(3, device=device, dtype=torch.float64)  # unobserved markers -> 0
+                static_canon = torch.linalg.solve(AtA, Atb).float()
+                os.makedirs(PATHS['checkpoints'], exist_ok=True)
+                np.save(os.path.join(PATHS['checkpoints'], f"{subject}_static_canon_{RUN_TAG}.npy"), static_canon.cpu().numpy())
+                logger.warning(f"[DATA] Static residual removed in the bone frame (stored units): median |c| {static_canon.norm(dim=-1).median().item():.4f}")
+
+            def posed_data_terms(out, residuals_gt, masks):
+                """--posed-data: (pred, target) posed marker shifts w.r.t. LBS, in the model frame. residuals_gt is
+                already scaled and masked (world frame)."""
+                target = residuals_gt @ RESIDUAL_TO_MODEL.to(residuals_gt.device).T
+                if out['rig_delta'] is not None:  # residual w.r.t. the new rig, same scale as the targets
+                    target = target + out['rig_delta'] * RESIDUAL_SCALE
+                if static_canon is not None:
+                    target = target - (out['marker_rot'] @ static_canon.unsqueeze(-1)).squeeze(-1) * (RESIDUAL_SCALE / 0.1)
+                return out['p_pred_theta'] - out['p_bind_theta'], target * masks.unsqueeze(-1)
 
             # =================================================================
             # --- NEW: LOAD CHECKPOINT (IF PROVIDED) ---
@@ -2822,6 +3384,25 @@ def train_full_model():
                 'face_adjacency': b_face_adjacency,
             }
             
+            # Volume-loss patches (skin and muscle layers share the face topology)
+            if FAT_PATCH_RADIUS > 0:
+                fat_patch = geodesic_face_patches(s_bind.cpu().numpy(), s_faces.cpu().numpy(), FAT_PATCH_RADIUS)
+                skin_geo['vol_patch'] = torch.from_numpy(fat_patch).long().to(device)
+                logger.info(f"[LOSS] Fat volume: {fat_patch.max() + 1} geodesic patches (radius {FAT_PATCH_RADIUS} m)")
+            if MUSC_PATCHES:
+                musc_patch = muscle_footprint_patches(m_bind.cpu().numpy(), m_faces.cpu().numpy(), muscle_obj_dir)
+                muscle_geo['vol_patch'] = torch.from_numpy(musc_patch).long().to(device)
+                logger.info(f"[LOSS] Muscle volume: {musc_patch.max() + 1} patches (individual-muscle footprints + per-prism elsewhere)")
+
+            if LAMBDAS["w_crease_skin"] > 0 or LAMBDAS["w_crease_musc"] > 0:
+                full = skin_weights_tensor.to(device).sum(dim=1) > 0.99  # hands have all-zero LBS weights
+                for geo in (skin_geo, muscle_geo):
+                    v, f, adj = geo['verts'].to(device), geo['faces'].to(device), geo['face_adjacency'].to(device)
+                    area = torch.cross(v[f[:, 1]] - v[f[:, 0]], v[f[:, 2]] - v[f[:, 0]], dim=-1).norm(dim=-1)
+                    ok = full[f].all(dim=1) & (area > 1e-10)
+                    geo['crease_pairs'] = adj[ok[adj[:, 0]] & ok[adj[:, 1]]]
+                logger.info(f"[LOSS] Crease loss face pairs: skin {len(skin_geo['crease_pairs'])}, muscle {len(muscle_geo['crease_pairs'])}")
+
             loss_fn = SOMALossOriginal(
                 skin_geo=skin_geo,
                 muscle_geo=muscle_geo,
@@ -2869,7 +3450,17 @@ def train_full_model():
         logger.info("[TRAIN] Starting training loop...")
         writer = SummaryWriter(os.path.join(PATHS['logs'], MODEL))
         best_val_loss = float('inf')
+        best_val_data_loss = float('inf')
         best_train_loss = float('inf')
+
+        # Marker neighbourhoods on the rest skin (--drop-isolated, w_unobs)
+        p_skin_rest = (bary_weights.unsqueeze(-1) * s_bind[bary_verts]).sum(1).detach().cpu().numpy()  # (M, 3)
+        marker_tree = KDTree(p_skin_rest)
+        marker_nbrs = torch.from_numpy(marker_tree.query(p_skin_rest, k=9)[1][:, 1:]).long().to(device)  # 8 nearest markers
+        v_dist, v_nbrs = marker_tree.query(s_bind.detach().cpu().numpy(), k=4)
+        vert_nbrs = torch.from_numpy(v_nbrs).long().to(device)  # (V, 4) nearest markers per skin vertex
+        vert_near = torch.from_numpy(v_dist[:, 0] < 0.05).float().to(device)  # vertices with a marker within 5 cm
+        unobs_mass = s_vertex_mass / s_vertex_mass.sum()
 
         for epoch in range(EPOCHS):
             model.train()
@@ -2900,6 +3491,8 @@ def train_full_model():
                 residuals_gt = residuals_gt.to(device)
                 masks = masks.to(device)
                 canonical_lbs = canonical_lbs.to(device)
+                if DROP_ISOLATED:  # observed markers surrounded by unobserved ones: edge-of-patch outliers
+                    masks = masks * (masks[:, marker_nbrs].sum(-1) >= 2).float()
 
                 batch_size = pose_rot.shape[0]
 
@@ -2919,6 +3512,16 @@ def train_full_model():
                 # D. GT Residuals
                 batch_size_residuals = residuals_gt.size(0)  # Get the actual batch size
                 residuals_gt = residuals_gt.view(batch_size_residuals, -1, 3)  # Automatically infer num_markers
+                if static_residual is not None:
+                    residuals_gt = residuals_gt - static_residual
+                if DROP_INCONSISTENT > 0:  # after the static canon (constant per-marker offsets are harmless); stored x0.1
+                    nb_obs = masks[:, marker_nbrs] > 0
+                    nb_med = torch.where(nb_obs.unsqueeze(-1), residuals_gt[:, marker_nbrs], torch.nan).nanmedian(dim=2).values
+                    bad = (masks > 0) & (nb_obs.sum(-1) >= 3) & ((residuals_gt - nb_med).norm(dim=-1) > 0.1 * DROP_INCONSISTENT)
+                    if epoch == 0 and batch_idx == 0:
+                        logger.warning(f"[DATA] --drop-inconsistent {DROP_INCONSISTENT}: {bad.sum().item() / max(masks.sum().item(), 1) * 100:.1f}% of observed markers dropped (first batch)")
+                    masks = masks * (~bad).float()
+                residuals_gt = residuals_gt * (RESIDUAL_SCALE / 0.1)  # stored residuals are (observed - LBS) * 0.1
 
                 # V2: REMOVING
                 # [FIX] Apply Global Offset Correction
@@ -2967,10 +3570,11 @@ def train_full_model():
                 hips_pos = j_rest[hips_idx]
                 pred_world = p_pred_tpose + hips_pos  
                 target_world = p_bind_tensor + residuals_gt
+                if POSED_DATA:
+                    pred_world, target_world = posed_data_terms(forward_output, residuals_gt, masks)
 
                 # B. Calculate Centroids
-                pred_centroid = pred_world.mean(dim=1, keepdim=True)
-                target_centroid = target_world.mean(dim=1, keepdim=True)
+                pred_centroid, target_centroid = marker_centroids(pred_world, target_world, masks)
 
                 # C. Center Both
                 pred_centered = pred_world - pred_centroid
@@ -2986,9 +3590,22 @@ def train_full_model():
                     s_final_theta, 
                     m_final_theta, 
                     b_final_theta,
-                    d_skin, 
-                    d_muscle
+                    d_skin,
+                    d_muscle,
+                    s_lbs_theta=forward_output['s_rig_theta'],
+                    m_lbs_theta=forward_output['m_rig_theta']
                 )
+                if RIGID_CORRECTION:
+                    loss_dict['rigid'] = forward_output['rigid_raw'].pow(2).mean()
+                    total_loss = total_loss + LAMBDAS['w_rigid'] * loss_dict['rigid']
+                if LAMBDAS['w_unobs'] > 0:
+                    # Pull to LBS where this frame has no data: |d|^2 weighted by the unobserved fraction of each
+                    # vertex's 4 nearest markers (area-weighted mean over the skin)
+                    u = (1 - masks[:, vert_nbrs].mean(-1)) * vert_near  # (B, V)
+                    # --unobs-normal: skin only along the rest normal (bulges), tangential sliding stays free
+                    skin_sq = (d_skin * s_normals_tensor).sum(-1).pow(2) if UNOBS_NORMAL else d_skin.pow(2).sum(-1)
+                    loss_dict['unobs'] = (u * (skin_sq + d_muscle.pow(2).sum(-1)) * unobs_mass).sum(-1).mean()
+                    total_loss = total_loss + LAMBDAS['w_unobs'] * loss_dict['unobs']
 
                 # Calculate loss with GT markers
                 # DEBUG: Print shapes and values to understand what's happening
@@ -2996,6 +3613,8 @@ def train_full_model():
                     logger.debug(f"[DEBUG] pred_world shape: {pred_world.shape}, min: {pred_world.min():.6f}, max: {pred_world.max():.6f}")
                     logger.debug(f"[DEBUG] target_world shape: {target_world.shape}, min: {target_world.min():.6f}, max: {target_world.max():.6f}")
                     logger.debug(f"[DEBUG] masks shape: {masks.shape}, sum: {masks.sum():.0f}")
+                    if 'unobs' in loss_dict:
+                        logger.debug(f"[DEBUG] unobs: {loss_dict['unobs'].item():.3e} (x w_unobs = {LAMBDAS['w_unobs'] * loss_dict['unobs'].item():.3f}), data x w_data = {LAMBDAS['w_data'] * loss_dict['data'].item():.3f}")
 
                 # ---
                 
@@ -3075,6 +3694,7 @@ def train_full_model():
                 writer.add_scalar('Loss_Batch/Train_Tangent_S', loss_dict.get('tangent_skin', 0.0), global_step) # <--- NEW
                 writer.add_scalar('Loss_Batch/Train_Volume_M', loss_dict.get('vol_musc', 0.0), global_step) # <--- NEW
                 writer.add_scalar('Loss_Batch/Train_Volume_S', loss_dict.get('vol_skin', 0.0), global_step) # <--- NEW
+                writer.add_scalar('Loss_Batch/Train_Unobs', loss_dict.get('unobs', 0.0), global_step)
                 # =================================================================
 
                 # Update progress bar
@@ -3090,8 +3710,12 @@ def train_full_model():
                     'tan_m': f"{loss_dict.get('tangent_musc', 0.0):.5f}",
                     'tan_s': f"{loss_dict.get('tangent_skin', 0.0):.5f}",
                     'vol_m': f"{loss_dict.get('vol_musc', 0.0):.5f}",
-                    'vol_s': f"{loss_dict.get('vol_skin', 0.0):.5f}"
-                    
+                    'vol_s': f"{loss_dict.get('vol_skin', 0.0):.5f}",
+                    'inv_m': f"{loss_dict.get('inv_musc', 0.0):.5f}",
+                    'inv_s': f"{loss_dict.get('inv_skin', 0.0):.5f}",
+                    'cr_m': f"{loss_dict.get('crease_musc', 0.0):.5f}",
+                    'cr_s': f"{loss_dict.get('crease_skin', 0.0):.5f}"
+
                 })
 
             # --- End of Training Batch Loop ---
@@ -3129,14 +3753,14 @@ def train_full_model():
                     best_train_loss = avg_train_loss
                     checkpoint_path = os.path.join(PATHS['checkpoints'], f'{MODEL}_epoch_{epoch}.pth')
                     os.makedirs(PATHS['checkpoints'], exist_ok=True)
-                    torch.save(model.deformation_model.state_dict(), checkpoint_path)
+                    save_soma_checkpoint(model, checkpoint_path)
                     logger.success(f"✓ New best model saved (Train Loss: {best_train_loss:.6f})")
                 
-            logger.info(f"[TRAIN] Epoch {epoch+1}/{EPOCHS} | Tot: {avg_train_loss:.5f} | Data: {avg_train_data_loss:.5f} | Sm_M: {avg_train_sm_m:.5f} | Sm_S: {avg_train_sm_s:.5f} | St_M: {avg_train_st_m:.5f} | St_S: {avg_train_st_s:.5f} | Tan_M: {avg_train_tan_m:.5f} | Tan_S: {avg_train_tan_s:.5f} | Vol_M: {avg_train_vol_m:.5f} | Vol_S: {avg_train_vol_s:.5f} | Bi_M: {avg_train_bi_m:.5f} | Bi_S: {avg_train_bi_s:.5f}")
+            logger.info(f"[TRAIN] Epoch {epoch+1}/{EPOCHS} | Tot: {avg_train_loss:.3e} | Data: {avg_train_data_loss:.3e} | Sm_M: {avg_train_sm_m:.3e} | Sm_S: {avg_train_sm_s:.3e} | St_M: {avg_train_st_m:.3e} | St_S: {avg_train_st_s:.3e} | Tan_M: {avg_train_tan_m:.3e} | Tan_S: {avg_train_tan_s:.3e} | Vol_M: {avg_train_vol_m:.3e} | Vol_S: {avg_train_vol_s:.3e} | Bi_M: {avg_train_bi_m:.3e} | Bi_S: {avg_train_bi_s:.3e}")
             
             # --- Validation Loop ---
             if val_loader is not None:
-                model.train() # Keep train mode for BN statistics
+                model.eval()
                 
                 val_loss_total = 0.0
                 val_data_loss_total = 0.0
@@ -3186,11 +3810,17 @@ def train_full_model():
                         pred_world = val_p_pred_tpose + hips_pos
                         
                         # 4. Target World
-                        target_world = p_bind_tensor + val_residuals_gt.view(val_batch_size, -1, 3)
+                        val_residuals_gt = val_residuals_gt.view(val_batch_size, -1, 3)
+                        if static_residual is not None:
+                            val_residuals_gt = val_residuals_gt - static_residual
+                        val_residuals_gt = val_residuals_gt * (RESIDUAL_SCALE / 0.1)
+                        val_residuals_gt[val_masks == 0] = 0.0
+                        target_world = p_bind_tensor + val_residuals_gt
+                        if POSED_DATA:
+                            pred_world, target_world = posed_data_terms(val_forward_output, val_residuals_gt, val_masks)
 
                         # 5. Centering
-                        pred_centroid = pred_world.mean(dim=1, keepdim=True)
-                        target_centroid = target_world.mean(dim=1, keepdim=True)
+                        pred_centroid, target_centroid = marker_centroids(pred_world, target_world, val_masks)
                         
                         pred_centered = pred_world - pred_centroid
                         target_centered = target_world - target_centroid
@@ -3206,8 +3836,10 @@ def train_full_model():
                             val_s_final_theta, 
                             val_m_final_theta, 
                             val_b_final_theta,
-                            val_d_skin, 
-                            val_d_muscle
+                            val_d_skin,
+                            val_d_muscle,
+                            s_lbs_theta=val_forward_output['s_rig_theta'],
+                            m_lbs_theta=val_forward_output['m_rig_theta']
                         )
 
                         val_loss_total += val_total_loss.item()
@@ -3267,7 +3899,7 @@ def train_full_model():
                 writer.add_scalar('Loss_Epoch/Val_Volume_M', avg_val_vol_m, epoch)
                 writer.add_scalar('Loss_Epoch/Val_Volume_S', avg_val_vol_s, epoch)
 
-                logger.info(f"[VAL] Epoch {epoch+1}/{EPOCHS} - Tot: {avg_val_loss:.6f} | Data: {avg_val_data_loss:.6f} | Sm_M: {avg_val_sm_m:.6f} | Sm_S: {avg_val_sm_s:.6f} | St_M: {avg_val_st_m:.6f} | St_S: {avg_val_st_s:.6f} | Tan_M: {avg_val_tan_m:.6f} | Tan_S: {avg_val_tan_s:.6f} | Vol_M: {avg_val_vol_m:.6f} | Vol_S: {avg_val_vol_s:.6f} | Bi_M: {avg_val_bi_m:.6f} | Bi_S: {avg_val_bi_s:.6f}")
+                logger.info(f"[VAL] Epoch {epoch+1}/{EPOCHS} - Tot: {avg_val_loss:.3e} | Data: {avg_val_data_loss:.3e} | Sm_M: {avg_val_sm_m:.3e} | Sm_S: {avg_val_sm_s:.3e} | St_M: {avg_val_st_m:.3e} | St_S: {avg_val_st_s:.3e} | Tan_M: {avg_val_tan_m:.3e} | Tan_S: {avg_val_tan_s:.3e} | Vol_M: {avg_val_vol_m:.3e} | Vol_S: {avg_val_vol_s:.3e} | Bi_M: {avg_val_bi_m:.3e} | Bi_S: {avg_val_bi_s:.3e}")
 
                 # Save best model based on validation loss
                 if CONFIG["overfit_multiple"] == False and CONFIG["overfit_single"] == False:
@@ -3275,8 +3907,13 @@ def train_full_model():
                         best_val_loss = avg_val_loss
                         checkpoint_path = os.path.join(PATHS['checkpoints'], f'{MODEL}_epoch_{epoch}.pth')
                         os.makedirs(PATHS['checkpoints'], exist_ok=True)
-                        torch.save(model.deformation_model.state_dict(), checkpoint_path)
+                        save_soma_checkpoint(model, checkpoint_path)
                         logger.success(f"✓ New best model saved (Val Loss: {best_val_loss:.6f})")
+                    if avg_val_data_loss < best_val_data_loss:
+                        best_val_data_loss = avg_val_data_loss
+                        os.makedirs(PATHS['checkpoints'], exist_ok=True)
+                        save_soma_checkpoint(model, os.path.join(PATHS['checkpoints'], f'{MODEL}_best_data.pth'))
+                        logger.success(f"✓ New best-data model saved (epoch {epoch}, Val Data: {best_val_data_loss:.8f})")
 
                 model.train()  # Switch back to training mode
 
@@ -3289,6 +3926,7 @@ def train_full_model():
 
 if __name__ == '__main__':
     logger.info("=== END-TO-END TRAINING SCRIPT ===")
-    logger.info(f"[CONFIG] Subject: {CONFIG['subject']} | Architecture: {CONFIG['architecture']} | Preset: {ACTIVE_PRESET}")
+    logger.info(f"[CONFIG] Subject: {CONFIG['subject']} | Architecture: {CONFIG['architecture']} | Preset: {ACTIVE_PRESET} | Tag: {RUN_TAG}")
+    logger.info(f"[CONFIG] Epochs: {CONFIG['epochs']} | LR: {CONFIG['learning_rate']} | Data norm: {DATA_NORM} | Marker offset: {MARKER_OFFSET} | Transpose rot: {TRANSPOSE_ROT}")
     logger.info(f"[CONFIG] Lambdas: { {k: v for k, v in LAMBDAS.items()} }")
     train_full_model()

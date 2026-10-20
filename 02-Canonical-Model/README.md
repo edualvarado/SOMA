@@ -26,12 +26,12 @@ fix_manual_annotations.py         (Step 5)  reformat 1-pt annotation output
         ↓
 merge_marker_annotations.py       (Step 6)  merge final + 1-pt → markers-skin-final-corrected.json
         ↓
-  [Blender: 04-Blender/scripts/02_canonical_model/build_canonical_model.py]
+  [Blender: build_canonical_model.py, not included]
         ↓                         (Step 7 — local, manual)
 convert_output.py                 (Step 8)  convert Blender + triangulation outputs
 ```
 
-`draw-uv-markers.py` can be used at any stage to generate debug visualizations
+`draw_uv_markers.py` can be used at any stage to generate debug visualizations
 of the current annotation state.
 
 ---
@@ -118,13 +118,8 @@ the next step.
 
 ### Step 7 — Build canonical model in Blender (manual, local)
 
-Open Blender locally and run:
-
-```
-04-Blender/scripts/02_canonical_model/build_canonical_model.py
-```
-
-This script reads `markers-skin-final-corrected.json`, projects the UV
+Open Blender locally and run `build_canonical_model.py` (Blender script, not included in this
+repository). This script reads `markers-skin-final-corrected.json`, projects the UV
 annotations onto the 3D mesh, and writes two output files into
 `S{N}/uv_detections_charuco-suit/source/canonical_model/`:
 
@@ -202,9 +197,9 @@ S{N}/
 
 ## Utility Scripts
 
-- **`draw-uv-markers.py`** — Draws marker annotations on the UV image for
+- **`draw_uv_markers.py`** — Draws marker annotations on the UV image for
   visual inspection. Edit the file to point to the JSON and image you want
-  to visualize, then run `python draw-uv-markers.py`. Produces an overlay
+  to visualize, then run `python draw_uv_markers.py`. Produces an overlay
   with auto-detected markers in red and manual markers in green.
 
 ---

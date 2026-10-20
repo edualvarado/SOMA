@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 
 # --- CONFIGURATION ---
-SOURCE_BASE = Path(r"C:\Users\Eduardo\00-Local\Blender\SOMA\smpl\muscles")
+SOURCE_BASE = Path("path/to/smpl/muscles")  # folder with the HIT OBJ frame sequences
 FILE_NAME = "LT_mesh.obj"
 
 # ALIGNMENT SETTINGS

@@ -14,7 +14,7 @@ only the leftover local field. "Display gain" scales the shown displacement (the
 ~5 cm, exceeds the ~2-3 cm marker spacing, so ~0.1-0.3 reads cleanly on the dense cloud).
 
 Run:
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python visualize_residuals_viser.py [--dataset DIR] [--port 8080]
+  python visualize_residuals_viser.py [--data-root DIR] [--port 8080]
 Then open http://localhost:8080  (SSH tunnel if remote:  ssh -L 8080:localhost:8080 <host>).
 """
 import os
@@ -25,7 +25,6 @@ import numpy as np
 
 from batch_residuals import lbs_frame, rot_x, DEGREE_BVH_X   # reuse the exact LBS + conventions
 
-DATASET_DEFAULT = "/CT/SOMA/static00/SKIM_dataset"
 WORLD, CANON = "World (posed)", "Canonical (T-pose)"
 G_OFF, G_RIGID, G_SCALE = "Off", "Rigid", "Rigid+scale"
 
@@ -138,10 +137,13 @@ def scan(dataset):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--dataset", default=DATASET_DEFAULT)
+    ap.add_argument("--data-root", "--dataset", dest="dataset", metavar="DIR", default=os.environ.get("SKIM_ROOT"),
+                    help="SKIM dataset root (default: $SKIM_ROOT)")
     ap.add_argument("--port", type=int, default=8080)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
+    if not args.dataset:
+        ap.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
 
     subs, shots = scan(args.dataset)
     if not subs:

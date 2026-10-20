@@ -1,6 +1,6 @@
 """
 Script: verify_marker_LBS_weights.py
-Goal:   Sanity-check the output of create_marker_LBS_weights_final.py.
+Goal:   Sanity-check the output of create_marker_LBS_weights.py.
 
         For each marker corner it verifies:
           - Weights sum to ~1.0
@@ -22,7 +22,7 @@ def main():
         description="Verify that marker LBS weights are valid (normalized, non-negative, non-empty)."
     )
     parser.add_argument("--input", type=Path, required=True,
-                        help="Path to the marker LBS weights JSON produced by create_marker_LBS_weights_final.py.")
+                        help="Path to the marker LBS weights JSON produced by create_marker_LBS_weights.py.")
     args = parser.parse_args()
 
     logger.info("Loading marker LBS weights from: {}", args.input)

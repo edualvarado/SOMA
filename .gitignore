@@ -17,12 +17,15 @@ README_example.md
 02-Canonical-Model/S3/
 02-Canonical-Model/S4/
 02-Canonical-Model/S5/
-04-Blender/data/
+04-Blender/
 05-Training/checkpoints/
+/SKIM_V2/
+/SKIM_V2_build_logs/
 
 # ---- Archived code / logs / caches ----
 **/99-Archived/
 **/__pycache__/
+Showcase/cache/
 *.pyc
 *.pyo
 slurm_*.out
@@ -73,6 +76,8 @@ docs/index.html
 
 # ---- Internal / not for publication ----
 CLAUDE.md
+05-Training/RELEASE_NOTES.md
+Residuals-Python/raw_dirs.json
 Residuals-Python/RESUME.md
 Residuals-Python/FINDINGS.md
 *.bak
@@ -83,3 +88,10 @@ Residuals-Python/FINDINGS.md
 .idea/
 .vscode/
 *.swp
+
+# ---- Local training outputs / IDE ----
+05-Training/runs/
+05-Training/sweep_logs/
+05-Training/sweep_results.csv*
+05-Training/splits_old/
+.vs/

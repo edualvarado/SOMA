@@ -6,21 +6,21 @@ First stage of the SOMA pipeline. Processes multi-camera video of a subject wear
 
 ## Pipeline Overview
 
-The full pipeline runs 5 steps in sequence. The entry point is `suit-processing-job_final.sh` (SLURM batch job).
+The full pipeline runs 5 steps in sequence. The entry point is `suit_processing_job.sh` (SLURM batch job).
 
 ```
-detect_2D_final.py
+detect_2D.py
         ↓
-interpolation_2D_final.py
+interpolation_2D.py
         ↓
-tracking_3D_v2_final.py
+tracking_3D.py
         ↓
-interpolation_3D_final.py
+interpolation_3D.py
         ↓
-post_process_triangulation_v3_final.py
+post_process_triangulation.py
 ```
 
-### Step 1 — 2D Detection (`detect_2D_final.py`)
+### Step 1 — 2D Detection (`detect_2D.py`)
 
 Detects ChArUco marker corners in each camera stream independently. Writes results to:
 
@@ -30,7 +30,7 @@ Detects ChArUco marker corners in each camera stream independently. Writes resul
 
 Key arguments: `--folder`, `--board`, `--setup`, `--modulus`, `--parallel`, `--max_frames`
 
-### Step 2 — 2D Interpolation (`interpolation_2D_final.py`)
+### Step 2 — 2D Interpolation (`interpolation_2D.py`)
 
 Fills short gaps in the per-camera 2D detections using linear interpolation. Output goes to:
 
@@ -40,7 +40,7 @@ Fills short gaps in the per-camera 2D detections using linear interpolation. Out
 
 Key argument: `--frames_2D_int` (max gap length to interpolate, default 10)
 
-### Step 3 — 3D Triangulation (`tracking_3D_v2_final.py`)
+### Step 3 — 3D Triangulation (`tracking_3D.py`)
 
 Triangulates each marker across all camera pairs using the calibrated projection matrices. Per-frame results are aggregated and optionally refined via `least_squares` reprojection minimization. Outliers are rejected via median + z-score filtering before refinement. Output:
 
@@ -50,7 +50,7 @@ Triangulates each marker across all camera pairs using the calibrated projection
 
 Key arguments: `--folder`, `--frames_2D_int`, `--max_frames`
 
-### Step 4 — 3D Interpolation (`interpolation_3D_final.py`)
+### Step 4 — 3D Interpolation (`interpolation_3D.py`)
 
 Fills short gaps in the 3D trajectories. Output:
 
@@ -60,7 +60,7 @@ Fills short gaps in the 3D trajectories. Output:
 
 Key argument: `--frames_3D_int` (default 10)
 
-### Step 5 — Post-processing (`post_process_triangulation_v3_final.py`)
+### Step 5 — Post-processing (`post_process_triangulation.py`)
 
 4-stage cleaning pipeline applied to the interpolated 3D tracks:
 
@@ -80,16 +80,17 @@ Key arguments: `--folder`, `--frames_3D_int`, `--window_size`
 ## Running the Pipeline
 
 ```bash
-sbatch suit-processing-job_final.sh \
-  --folder /CT/SOMA/static00/data/<Subject-DD-MM-YY>/ \
-  --board /CT/SOMA/work/01-Suit-Processing/configs/suits/charuco-suit.json
+# from the repository root
+sbatch 01-Suit-Processing/suit_processing_job.sh \
+  --folder /path/to/<subject capture>/ \
+  --board 01-Suit-Processing/configs/suits/charuco-suit.json
 ```
 
-Before submitting, edit `suit-processing-job_final.sh` and set `SHOTS_TO_PROCESS` to the correct subject array:
+Before submitting, edit `suit_processing_job.sh` and set `SHOTS_TO_PROCESS` to the correct subject array:
 
 ```bash
-# Options: SHOTS_VALENTIN, SHOTS_TIMO, SHOTS_MONA, SHOTS_SARAH
-SHOTS_TO_PROCESS=("${SHOTS_SARAH[@]}")
+# Options: SHOTS_S2, SHOTS_S3, SHOTS_S4, SHOTS_S5
+SHOTS_TO_PROCESS=("${SHOTS_S5[@]}")
 ```
 
 The script expects `--folder` to point to the **parent directory** containing `shot_001/`, `shot_002/`, etc.

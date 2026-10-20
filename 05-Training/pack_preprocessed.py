@@ -6,6 +6,8 @@ Each packed file  <S>/preprocessed_vFinal_clean/<shot>.npz  holds the whole shot
     pose       (F, J*6) float32   -- 6D pose (same convention as the per-frame pose_rotations)
     residuals  (F, M, 3) float16  -- scaled GT residual (residual_m * 0.1); cast to float at load
     masks      (F, M)   uint8     -- visibility
+    global_R   (3, 3)   float32   -- per-shot LBS->observed alignment (residual = obs - (global_R @ LBS + global_t));
+                                     the loaders rotate the residuals by global_R^T
 The unused-in-training `canonical_lbs` is intentionally dropped (the loader synthesizes a zero
 placeholder so the existing 4-tuple training interface is unchanged).
 
@@ -13,21 +15,21 @@ It is regenerated from the source (SKIM <shot>.npz + the shot BVH) using the SAM
 preprocess_from_skim.py -- identical values to the per-frame files (verified by --validate),
 so it does not need to read the 1.14M per-frame .npy.
 
-Run:
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python pack_preprocessed.py --subjects S1 S2 S3 S4 S5
+Run (SKIM root from --data-root, else $SKIM_ROOT; --out defaults to the same root):
+  python pack_preprocessed.py --subjects S1 S2 S3 S4 S5
   ... --validate     # additionally compare packed vs the existing per-frame .npy and report
 """
 import os, sys, glob, argparse
 import numpy as np
 
-sys.path.insert(0, "/CT/SOMA/work/Residuals-Python")
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "Residuals-Python"))
 from pymotion.io.bvh import BVH
 import batch_residuals as B
-from preprocess_from_skim import pose6d_old_all, SKIM
+from preprocess_from_skim import pose6d_old_all
 
 
-def pack_subject(S, root, log=print):
-    npzs = sorted(glob.glob(f"{SKIM}/{S}/shot_*.npz"))
+def pack_subject(S, skim_root, root, log=print):
+    npzs = sorted(glob.glob(f"{skim_root}/{S}/shot_*.npz"))
     out_dir = f"{root}/{S}/preprocessed_vFinal_clean"
     os.makedirs(out_dir, exist_ok=True)
     total = 0
@@ -39,7 +41,8 @@ def pack_subject(S, root, log=print):
         fidx = d["frame_index"].astype(int)             # (F,)
         bvh = BVH(); bvh.load(B.bvh_path(S, shot))
         pose = pose6d_old_all(bvh)[fidx].astype(np.float32)   # (F, J*6)
-        np.savez_compressed(f"{out_dir}/{shot}.npz", pose=pose, residuals=res, masks=mask)
+        np.savez_compressed(f"{out_dir}/{shot}.npz", pose=pose, residuals=res, masks=mask,
+                            global_R=d["global_R"].astype(np.float32))
         total += res.shape[0]
         log(f"  {S}/{shot}: F={res.shape[0]} M={res.shape[1]} -> {os.path.getsize(f'{out_dir}/{shot}.npz')/1e6:.1f}MB")
     log(f"  {S}: {len(npzs)} shots, {total} frames packed")
@@ -75,13 +78,17 @@ def validate_subject(S, root, n_frames=6, log=print):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--subjects", nargs="+", default=["S1", "S2", "S3", "S4", "S5"])
-    ap.add_argument("--out", default=SKIM)
+    ap.add_argument("--data-root", default=os.environ.get("SKIM_ROOT"), help="SKIM dataset root (default: $SKIM_ROOT)")
+    ap.add_argument("--out", default=None, help="output root (default: --data-root)")
     ap.add_argument("--validate", action="store_true")
     args = ap.parse_args()
+    if not args.data_root:
+        ap.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
+    args.out = args.out or args.data_root
     allok = True
     for S in args.subjects:
         print(f"=== {S} ===")
-        pack_subject(S, args.out)
+        pack_subject(S, args.data_root, args.out)
         if args.validate:
             allok &= validate_subject(S, args.out)
     print("DONE" + ("" if allok else "  (VALIDATION MISMATCH!)"))

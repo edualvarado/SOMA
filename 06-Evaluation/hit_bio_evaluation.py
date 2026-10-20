@@ -14,7 +14,7 @@ SEQUENCE = "shot_002"
 
 NUMBER_OF_FRAMES = None
 
-BASE_DIR = Path(rf"/CT/soma-experiments/work/HIT/outputs_soma_eval/{SUBJECT}/{SEQUENCE}")  # Adjust base path as needed
+BASE_DIR = Path(os.environ.get("HIT_OUTPUTS", "HIT/outputs_soma_eval")) / SUBJECT / SEQUENCE  # HIT outputs ($HIT_OUTPUTS)
 RESULTS_FILE = Path(f"hit_bio_evaluation_results_{SUBJECT}_{SEQUENCE}.json")
 HIT_SUBFOLDER = ["hit_male_best", "hit_female_best"]
 

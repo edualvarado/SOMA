@@ -25,6 +25,7 @@ Usage:
     python 00_preprocess_data.py --subject S1 --base_dir /custom/path/S1
 """
 
+import os
 import json
 import argparse
 from pathlib import Path
@@ -261,12 +262,12 @@ def main():
     )
     parser.add_argument(
         "--base_dir", type=Path, default=None,
-        help="Override base directory. Defaults to '/CT/SOMA/static00/{subject}'."
+        help="Override base directory. Defaults to '$SOMA_STATIC/{subject}' (SOMA_STATIC defaults to 'static00')."
     )
     args = parser.parse_args()
 
     subject  = args.subject
-    base_dir = args.base_dir or Path(f"/CT/SOMA/static00/{subject}")
+    base_dir = args.base_dir or Path(os.environ.get("SOMA_STATIC", "static00")) / subject
 
     paths = {
         "raw_dir":       base_dir / "raw",

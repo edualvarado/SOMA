@@ -11,8 +11,9 @@ displaced along its surface normal.
                             matching the old 'pure deformation' signed-distance maps.
 
 Run (default S1/shot_001):
-  /CT/SOMA/static00/miniforge3/envs/soma/bin/python visualize_skin_heatmap.py [--subject S1] [--shot shot_001] [--port 8081]
+  python visualize_skin_heatmap.py [--data-root DIR] [--subject S1] [--shot shot_001] [--port 8081]
 """
+import os
 import glob
 import time
 import argparse
@@ -24,8 +25,6 @@ import matplotlib
 
 from visualize_residuals_viser import Shot, rot_x, kabsch, scan
 
-DATASET = "/CT/SOMA/static00/SKIM_dataset"
-STATIC = "/CT/SOMA/static00"
 K = 8
 CLAMP_M = 0.25          # hard ceiling on a marker's scalar (m); catches unpose blow-ups
 MAD_K = 6.0             # robust outlier threshold (modified z-score) for the per-frame safety net
@@ -33,19 +32,19 @@ FROZEN_TOK = ("head", "hand", "foot", "toe")   # joints whose region is never di
 MAGNITUDE, SIGNED = "Magnitude", "Signed normal (bulge)"
 
 
-def skin_mesh_path(subject):
-    for pat in (f"{STATIC}/{subject}/layers/tpose/skin_layer-{subject}-TPose.obj",
-                f"{STATIC}/{subject}/layers/tpose/skin_layer-*-TPose.obj",
-                f"{STATIC}/{subject}/layers/tpose/skin_layer*TPose*.obj"):
+def skin_mesh_path(root, subject):
+    for pat in (f"{root}/{subject}/layers/tpose/skin_layer-{subject}-TPose.obj",
+                f"{root}/{subject}/layers/tpose/skin_layer-*-TPose.obj",
+                f"{root}/{subject}/layers/tpose/skin_layer*TPose*.obj"):
         hits = sorted(glob.glob(pat))
         if hits:
             return hits[0]
     raise FileNotFoundError(f"no canonical skin mesh for {subject}")
 
-def muscle_mesh_path(subject):
-    for pat in (f"{STATIC}/{subject}/layers/tpose/musc_layer-{subject}-TPose.obj",
-                f"{STATIC}/{subject}/layers/tpose/musc_layer-*-TPose.obj",
-                f"{STATIC}/{subject}/layers/tpose/musc_layer*TPose*.obj"):
+def muscle_mesh_path(root, subject):
+    for pat in (f"{root}/{subject}/layers/tpose/musc_layer-{subject}-TPose.obj",
+                f"{root}/{subject}/layers/tpose/musc_layer-*-TPose.obj",
+                f"{root}/{subject}/layers/tpose/musc_layer*TPose*.obj"):
         hits = sorted(glob.glob(pat))
         if hits:
             return hits[0]
@@ -64,11 +63,15 @@ def colormap_rgb(values, vmax, signed):
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--data-root", default=os.environ.get("SKIM_ROOT"), help="SKIM dataset root (default: $SKIM_ROOT)")
     ap.add_argument("--subject", default="S1")
     ap.add_argument("--shot", default="shot_001")
     ap.add_argument("--port", type=int, default=8081)
     ap.add_argument("--smoke", action="store_true")
     args = ap.parse_args()
+    if not args.data_root:
+        ap.error("SKIM dataset root not set: export SKIM_ROOT=/path/to/SKIM_dataset or pass --data-root")
+    DATASET = args.data_root
 
     subs, shots = scan(DATASET)
     if not subs:
@@ -78,7 +81,7 @@ def main():
     state = {"_sc_cache": {}, "_sc_key": [None]}
 
     def load_subject(subject):
-        mesh = trimesh.load(muscle_mesh_path(subject), process=False)
+        mesh = trimesh.load(muscle_mesh_path(DATASET, subject), process=False)
         raw = (rot_x(90.0) @ np.asarray(mesh.vertices).T).T
         verts, inv = np.unique(np.round(raw, 5), axis=0, return_inverse=True)
         faces = inv[np.asarray(mesh.faces)]

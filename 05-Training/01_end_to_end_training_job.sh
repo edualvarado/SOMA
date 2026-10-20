@@ -8,14 +8,10 @@
 #SBATCH -o slurm_train-%j.out    # Log output file
 
 # ==============================================================================
-# Script to run SOMA End-to-End Training on Slurm.
+# Script to run SOMA End-to-End Training on Slurm. Arguments are passed to
+# 01_end_to_end_training.py, e.g.:
+#   sbatch 01_end_to_end_training_job.sh --subject S2 --epochs 40
 # ==============================================================================
-
-# JOBS
-# ====
-
-
-# ====
 
 # 1. Setup Environment
 # --------------------
@@ -54,7 +50,7 @@ echo "=================================================="
 # 4. Run Training
 # ---------------
 # Using 'python -u' allows stdout to be unbuffered (better for real-time log monitoring)
-python -u 01_end_to_end_training.py
+python -u 01_end_to_end_training.py "$@"
 
 echo "=================================================="
 echo "Training Finished."

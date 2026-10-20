@@ -15,11 +15,12 @@ DEPTH_OFFSET = -0.02
 SUBJECT = "S1"
 
 # Paths
-HIT_BASE_DIR = Path(rf"/CT/SOMA/static00/outputs_hit_smpl/")
-RESIDUALS_DIR = Path(rf"/CT/SOMA/static00/S1/preprocessed_vFinal_clean/residuals/")
-GT_BIND_MARKERS_PATH = Path(rf"/CT/SOMA/static00/{SUBJECT}/canonical_model/{SUBJECT}_canonical_data_tpose.json")
+STATIC = Path(os.environ.get("SOMA_STATIC", "static00"))  # raw capture working tree
+HIT_BASE_DIR = STATIC / "outputs_hit_smpl"
+RESIDUALS_DIR = STATIC / "S1" / "preprocessed_vFinal_clean" / "residuals"
+GT_BIND_MARKERS_PATH = STATIC / SUBJECT / "canonical_model" / f"{SUBJECT}_canonical_data_tpose.json"
 BARY_MAP_PATH = Path("soma_to_smpl_barycentric_map.json")
-VALIDATION_SET_PATH = Path(rf"/CT/SOMA/work/05-Training/{SUBJECT}_validation_filepaths.json")
+VALIDATION_SET_PATH = Path(__file__).resolve().parent.parent / "05-Training" / f"{SUBJECT}_validation_filepaths.json"
 
 def _rot_x(points, deg=0.0):
     R = Rotation.from_euler('x', deg, degrees=True).as_matrix()
@@ -106,9 +107,9 @@ def run_evaluation():
         
         # F. DRE Calculation (Tau movement relative to Frame 0)
         movement = np.linalg.norm(p_gt_aligned - p_gt_start, axis=1) * 1000.0
-        dre_15.extend(dist[movement > 25.0])
+        dre_15.extend(dist[movement > 15.0])
         dre_20.extend(dist[movement > 20.0])
-        dre_25.extend(dist[movement > 15.0])
+        dre_25.extend(dist[movement > 25.0])
 
     # 5. Print Results
     print("\n" + "="*45)

@@ -25,7 +25,7 @@ JSON structure (corners_markers and corners_charuco):
 }
 
 Example usage:
-    python detect_2D_uv.py --folder /CT/MUSK/static00/280424-testbench/v2-scans/inside-humans/ --board configs/suits/charuco-suit.json --debug
+    python detect_2D_uv.py --folder /path/to/scans/ --board configs/suits/charuco-suit.json --debug
 
 We run the detection in the skin image. Problems:
 - Sparse detections (fixed with manual annotation)
